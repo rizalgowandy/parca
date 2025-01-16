@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+# Copyright 2022-2025 The Parca Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+# Run the configure hook which sets defaults for any config options
+"${SNAP}"/snap/hooks/configure
+
+# Grab the config options
+storage_active_memory="$(snapctl get storage-active-memory)"
+log_level="$(snapctl get log-level)"
+storage_persist="$(snapctl get enable-persistence)"
+http_address="$(snapctl get http-address)"
+http_path_prefix="$(snapctl get http-path-prefix)"
+debuginfod_upstream_servers="$(snapctl get debuginfod-upstream-servers)"
+
+store="$(snapctl get remote-store-address)"
+insecure="$(snapctl get remote-store-insecure)"
+token="$(snapctl get remote-store-bearer-token)"
+
+# Start building an array of command line options
+opts=(
+    "--config-path=${SNAP_DATA}/parca.yaml"
+    "--log-level=${log_level}"
+    "--http-address=${http_address}"
+)
+
+if [ -n "$http_path_prefix" ]; then
+    opts+=("--path-prefix=${http_path_prefix}")
+fi
+
+if [ -n "$debuginfod_upstream_servers" ]; then
+    opts+=("--debuginfod-upstream-servers=${debuginfod_upstream_servers}")
+fi
+
+# If there is a token set for a store, then enable sending profiles to a remote store.
+# Ensure we set the mode to scraper only in this instance.
+if [[ -n "${token}" ]]; then
+    opts+=(
+        "--store-address=${store}"
+        "--bearer-token=${token}"
+        "--insecure=${insecure}"
+        "--mode=scraper-only"
+    )
+else
+    # Only configure persistence and storage if we're not sending to a remote store.
+
+    # Switch out command line options depending on whether the user has
+    # specified storage-persist=true
+    if [[ "${storage_persist}" == "true" ]]; then
+        opts+=(
+            "--enable-persistence=true"
+            "--storage-path=${SNAP_COMMON}/profiles"
+        )
+    else
+        opts+=(
+            "--enable-persistence=false"
+            "--storage-active-memory=${storage_active_memory}"
+        )
+    fi
+fi
+
+# Run parca with the gathered arguments
+exec "${SNAP}"/parca "${opts[@]}"

@@ -1,16 +1,21 @@
 {
   "extends": "./config/next.tsconfig.json",
-  "include": [
-    "./tests/**/*",
-    "./.storybook/*",
-    "./packages/**/*"
-  ],
+  "include": ["./tests/**/*", "./.storybook/*", "./packages/**/*"],
   "compilerOptions": {
-    "module": "CommonJS",
+    "module": "es2020",
+    "moduleResolution": "node",
+    "strict": true,
     "isolatedModules": true,
-    "baseUrl": "."
+    "baseUrl": ".",
+    "target": "es2020"
   },
-  "exclude": [
-    "node_modules"
-  ]
+  "exclude": ["node_modules", "**/*.benchmark.tsx"],
+  "ts-node": {
+    "esm": true,
+    "compilerOptions": {
+      "target": "es2020",
+      "module": "es2020",
+      "types": ["vite/client"]
+    }
+  }
 }

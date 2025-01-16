@@ -7,6 +7,9 @@
   "tags": [
     {
       "name": "ProfileStoreService"
+    },
+    {
+      "name": "AgentsService"
     }
   ],
   "consumes": [
@@ -16,6 +19,72 @@
     "application/json"
   ],
   "paths": {
+    "/agents": {
+      "get": {
+        "summary": "Agents return the agents that pushed data to the server",
+        "operationId": "AgentsService_Agents",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1alpha1AgentsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "AgentsService"
+        ]
+      }
+    },
+    "/profiles/write": {
+      "post": {
+        "summary": "Write accepts profiling data encoded as an arrow record. It's a\nbi-directional streaming RPC, because the first message can contain only\nsamples without the stacktraces, and only reference stacktrace IDs. The\nbackend can then request the full stacktrace from the client should it not\nknow the stacktrace yet.",
+        "operationId": "ProfileStoreService_Write",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/v1alpha1WriteResponse"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of v1alpha1WriteResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "WriteRequest may contain an apache arrow record that only contains profiling\nsamples with a reference to a stacktrace ID, or a full stacktrace. If it\nonly contains samples, the server may request the full stacktrace from the\nclient should it not already know them. (streaming inputs)",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1alpha1WriteRequest"
+            }
+          }
+        ],
+        "tags": [
+          "ProfileStoreService"
+        ]
+      }
+    },
     "/profiles/writeraw": {
       "post": {
         "summary": "WriteRaw accepts a raw set of bytes of a pprof file",
@@ -68,14 +137,11 @@
     "protobufAny": {
       "type": "object",
       "properties": {
-        "typeUrl": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -90,10 +156,63 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }
       }
+    },
+    "v1alpha1Agent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "id is the agent identity that either represent by the node name or the IP address.\nWhen node name is not found, this will fallback to IP address."
+        },
+        "lastError": {
+          "type": "string",
+          "title": "last_error is the error message most recently received from a push attempt"
+        },
+        "lastPush": {
+          "type": "string",
+          "format": "date-time",
+          "title": "last_push is the time stamp the last push request was performed"
+        },
+        "lastPushDuration": {
+          "type": "string",
+          "title": "last_push_duration is the duration of the last push request"
+        }
+      },
+      "title": "Agent is the agent representation"
+    },
+    "v1alpha1AgentsResponse": {
+      "type": "object",
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1alpha1Agent"
+          },
+          "title": "agents is a list of agents"
+        }
+      },
+      "title": "AgentsResponse is the request to retrieve a list of agents"
+    },
+    "v1alpha1ExecutableInfo": {
+      "type": "object",
+      "properties": {
+        "elfType": {
+          "type": "integer",
+          "format": "int64",
+          "description": "elf_type is the type of the elf executable. Technically the elf type is a\n16 bit integer, but protobuf's smallest unsigned integer is 32 bits."
+        },
+        "loadSegment": {
+          "$ref": "#/definitions/v1alpha1LoadSegment",
+          "description": "load_segment is the load segment of the executable."
+        }
+      },
+      "description": "ExecutableInfo is the information about the executable and executable\nsection for normalizaton purposes before symbolization."
     },
     "v1alpha1LabelSet": {
       "type": "object",
@@ -101,12 +220,29 @@
         "labels": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/profilestorev1alpha1Label"
           },
           "title": "labels are the grouping of labels"
         }
       },
       "title": "LabelSet is a group of labels"
+    },
+    "v1alpha1LoadSegment": {
+      "type": "object",
+      "properties": {
+        "offset": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The offset from the beginning of the file at which the first byte of the segment resides."
+        },
+        "vaddr": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The virtual address at which the first byte of the segment resides in memory."
+        }
+      },
+      "title": "LoadSegment is the load segment of the executable"
     },
     "v1alpha1RawProfileSeries": {
       "type": "object",
@@ -118,6 +254,7 @@
         "samples": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/v1alpha1RawSample"
           },
           "title": "samples are the set of profile bytes"
@@ -132,6 +269,14 @@
           "type": "string",
           "format": "byte",
           "title": "raw_profile is the set of bytes of the pprof profile"
+        },
+        "executableInfo": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1alpha1ExecutableInfo"
+          },
+          "description": "information about the executable and executable section for normalizaton\npurposes."
         }
       },
       "title": "RawSample is the set of bytes that correspond to a pprof profile"
@@ -146,9 +291,14 @@
         "series": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/v1alpha1RawProfileSeries"
           },
           "title": "series is a set raw pprof profiles and accompanying labels"
+        },
+        "normalized": {
+          "type": "boolean",
+          "title": "normalized is a flag indicating if the addresses in the profile is normalized for position independent code"
         }
       },
       "title": "WriteRawRequest writes a pprof profile for a given tenant"
@@ -156,6 +306,28 @@
     "v1alpha1WriteRawResponse": {
       "type": "object",
       "title": "WriteRawResponse is the empty response"
+    },
+    "v1alpha1WriteRequest": {
+      "type": "object",
+      "properties": {
+        "record": {
+          "type": "string",
+          "format": "byte",
+          "description": "The bytes containing the arrow record."
+        }
+      },
+      "description": "WriteRequest may contain an apache arrow record that only contains profiling\nsamples with a reference to a stacktrace ID, or a full stacktrace. If it\nonly contains samples, the server may request the full stacktrace from the\nclient should it not already know them."
+    },
+    "v1alpha1WriteResponse": {
+      "type": "object",
+      "properties": {
+        "record": {
+          "type": "string",
+          "format": "byte",
+          "description": "When record is non-empty it contains the bytes of an arrow record that\ncontains a column containing the stacktraces that are unknown."
+        }
+      },
+      "description": "WriteResponse may be empty if the server doesn't need any further\ninformation, or contain an arrow record that contains the stacktrace IDs\nthat are unknown and therefore requested by the client from the server."
     }
   }
 }

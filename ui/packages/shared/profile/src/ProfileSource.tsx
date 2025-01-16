@@ -1,307 +1,269 @@
-import React from 'react'
-import moment from 'moment'
-import { Query } from '@parca/parser'
-import { Label, QueryRequest, ProfileDiffSelection, SingleProfile, MergeProfile, DiffProfile } from '@parca/client'
-import { Timestamp } from 'google-protobuf/google/protobuf/timestamp_pb'
+// Copyright 2022 The Parca Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import {
+  ProfileDiffSelection,
+  ProfileDiffSelection_Mode,
+  QueryRequest,
+  QueryRequest_Mode,
+  QueryRequest_ReportType,
+  Timestamp,
+} from '@parca/client';
+import {Matcher, NewParser, ProfileType, Query} from '@parca/parser';
+import {formatDate, formatDuration} from '@parca/utilities';
 
 export interface ProfileSource {
-  QueryRequest: () => QueryRequest
-  DiffSelection: () => ProfileDiffSelection
-  Describe: () => JSX.Element
-  toString: () => string
+  QueryRequest: () => QueryRequest;
+  ProfileType: () => ProfileType;
+  DiffSelection: () => ProfileDiffSelection;
+  toString: (timezone?: string) => string;
 }
 
 export interface ProfileSelection {
-  ProfileName: () => string
-  HistoryParams: () => { [key: string]: any }
-  ProfileSource: () => ProfileSource
-  Type: () => string
+  ProfileName: () => string;
+  HistoryParams: () => {[key: string]: any};
+  ProfileSource: () => ProfileSource;
+  Type: () => string;
+}
+const timeFormat = (timezone?: string): string => {
+  if (timezone !== undefined) {
+    return 'yyyy-MM-dd HH:mm:ss';
+  }
+
+  return "yyyy-MM-dd HH:mm:ss '(UTC)'";
+};
+
+export function ParamsString(params: {[key: string]: string}): string {
+  return Object.keys(params)
+    .map(function (key) {
+      return `${key}=${params[key]}`;
+    })
+    .join('&');
 }
 
-export const timeFormat = 'MMM D, [at] h:mm:s a [(UTC)]'
-export const timeFormatShort = 'MMM D, h:mma'
-
-export function ParamsString (params: { [key: string]: string }): string {
-  return Object.keys(params).map(function (key) { return `${key}=${params[key]}` }).join('&')
-}
-
-export function SuffixParams (params: { [key: string]: any }, suffix: string): { [key: string]: any } {
+export function SuffixParams(params: {[key: string]: any}, suffix: string): {[key: string]: any} {
   return Object.fromEntries(
     Object.entries(params).map(([key, value]) => [`${key}${suffix}`, value])
-  )
+  );
 }
 
-export function ParseLabels (labels: string[]): Label.AsObject[] {
-  return labels.map(function (labelString): Label.AsObject {
-    const parts = labelString.split('=', 2)
-    return { name: parts[0], value: parts[1] }
-  })
-}
-
-export function ProfileSelectionFromParams (
-  expression: string | undefined,
-  from: string | undefined,
-  to: string | undefined,
-  merge: string | undefined,
-  labels: string[] | undefined,
-  time: string | undefined
+export function ProfileSelectionFromParams(
+  mergeFrom: string | undefined,
+  mergeTo: string | undefined,
+  selection: string | undefined,
+  filterQuery?: string
 ): ProfileSelection | null {
-  if (merge !== undefined && merge === 'true' && from !== undefined && to !== undefined && expression !== undefined) {
-    return new MergedProfileSelection(parseInt(from), parseInt(to), expression)
-  }
-  if (labels !== undefined && time !== undefined) {
-    return new SingleProfileSelection(ParseLabels(labels), parseInt(time))
-  }
-  return null
-}
+  if (
+    mergeFrom !== undefined &&
+    mergeTo !== undefined &&
+    selection !== undefined &&
+    selection !== ''
+  ) {
+    const p = NewParser();
+    p.save();
+    const {successfulParse} = Query.tryParse(p, selection);
 
-export class SingleProfileSelection implements ProfileSelection {
-  labels: Label.AsObject[]
-  time: number
-
-  constructor (labels: Label.AsObject[], time: number) {
-    this.labels = labels
-    this.time = time
-  }
-
-  ProfileName (): string {
-    const label = this.labels.find((e) => e.name === '__name__')
-    return label !== undefined ? label.value : ''
-  }
-
-  HistoryParams (): { [key: string]: any } {
-    return {
-      labels: this.labels.map((label) => `${label.name}=${label.value}`),
-      time: this.time
+    if (!successfulParse) {
+      console.log('Failed to parse selected query.');
+      console.log(selection);
+      return null;
     }
+
+    return new MergedProfileSelection(
+      parseInt(mergeFrom),
+      parseInt(mergeTo),
+      Query.parse(selection),
+      filterQuery
+    );
   }
 
-  Type (): string {
-    return 'single'
-  }
-
-  ProfileSource (): ProfileSource {
-    return new SingleProfileSource(
-      this.labels,
-      this.time
-    )
-  }
+  return null;
 }
 
 export class MergedProfileSelection implements ProfileSelection {
-  from: number
-  to: number
-  query: string
+  mergeFrom: number;
+  mergeTo: number;
+  query: Query;
+  filterQuery: string | undefined;
+  profileSource: ProfileSource;
 
-  constructor (from: number, to: number, query: string) {
-    this.from = from
-    this.to = to
-    this.query = query
+  constructor(mergeFrom: number, mergeTo: number, query: Query, filterQuery?: string) {
+    this.mergeFrom = mergeFrom;
+    this.mergeTo = mergeTo;
+    this.query = query;
+    this.filterQuery = filterQuery;
+    this.profileSource = new MergedProfileSource(
+      this.mergeFrom,
+      this.mergeTo,
+      this.query,
+      this.filterQuery
+    );
   }
 
-  ProfileName (): string {
-    return Query.parse(this.query).profileName()
+  ProfileName(): string {
+    return this.query.profileName();
   }
 
-  HistoryParams (): { [key: string]: string } {
+  HistoryParams(): {[key: string]: any} {
     return {
-      mode: 'merge',
-      from: this.from.toString(),
-      to: this.to.toString(),
-      query: this.query
-    }
+      merge_from: this.mergeFrom.toString(),
+      merge_to: this.mergeTo.toString(),
+      selection: encodeURIComponent(this.query.toString()),
+    };
   }
 
-  Type (): string {
-    return 'merge'
+  Type(): string {
+    return 'merge';
   }
 
-  ProfileSource (): ProfileSource {
-    return new MergedProfileSource(
-      this.from,
-      this.to,
-      this.query
-    )
-  }
-}
-
-export class SingleProfileSource implements ProfileSource {
-  labels: Label.AsObject[]
-  time: number
-
-  constructor (labels: Label.AsObject[], time: number) {
-    this.labels = labels
-    this.time = time
-  }
-
-  query (): string {
-    const seriesQuery = this.labels.reduce(function (agg: string, label: Label.AsObject) {
-      return agg + `${label.name}="${label.value}",`
-    }, '{')
-    return seriesQuery + '}'
-  }
-
-  DiffSelection (): ProfileDiffSelection {
-    const sel = new ProfileDiffSelection()
-    sel.setMode(ProfileDiffSelection.Mode.MODE_SINGLE_UNSPECIFIED)
-
-    const singleProfile = new SingleProfile()
-    const ts = new Timestamp()
-    ts.fromDate(moment(this.time).toDate())
-    singleProfile.setTime(ts)
-    singleProfile.setQuery(this.query())
-    sel.setSingle(singleProfile)
-
-    return sel
-  }
-
-  QueryRequest (): QueryRequest {
-    const req = new QueryRequest()
-    req.setMode(QueryRequest.Mode.MODE_SINGLE_UNSPECIFIED)
-    const singleQueryRequest = new SingleProfile()
-    const ts = new Timestamp()
-    ts.fromDate(moment(this.time).toDate())
-    singleQueryRequest.setTime(ts)
-    singleQueryRequest.setQuery(this.query())
-    req.setSingle(singleQueryRequest)
-    return req
-  }
-
-  profileName (): string {
-    const label = this.labels.find((e) => e.name === '__name__')
-    return label !== undefined ? label.value : ''
-  }
-
-  Describe (): JSX.Element {
-    const profileName = this.profileName()
-    return (
-      <>
-        <p>
-          {profileName !== '' ? <a>{profileName} profile of </a> : ''}{'  '}
-          {this.labels.filter(label => (label.name !== '__name__')).map((label) => (
-              <button
-                  key={label.name}
-                  type="button"
-                  className="inline-block rounded-lg text-gray-700 bg-gray-200 dark:bg-gray-700 dark:text-gray-400 px-2 py-1 text-xs font-bold mr-3"
-              >
-                  {`${label.name}="${label.value}"`}
-              </button>
-          ))}
-        </p>
-        <p>
-          {moment(this.time).utc().format(timeFormat)}
-        </p>
-      </>
-    )
-  }
-
-  stringLabels (): string[] {
-    return this.labels.filter((label: Label.AsObject) => (label.name !== '__name__')).map((label: Label.AsObject) => `${label.name}=${label.value}`)
-  }
-
-  toString (): string {
-    return `single profile of type ${this.profileName()} with labels ${this.stringLabels().join(', ')} collected at ${moment(this.time).utc().format(timeFormat)}`
+  ProfileSource(): ProfileSource {
+    return this.profileSource;
   }
 }
 
 export class ProfileDiffSource implements ProfileSource {
-  a: ProfileSource
-  b: ProfileSource
+  a: ProfileSource;
+  b: ProfileSource;
+  filterQuery: string | undefined;
+  profileType: ProfileType;
+  absolute?: boolean;
 
-  constructor (a: ProfileSource, b: ProfileSource) {
-    this.a = a
-    this.b = b
+  constructor(a: ProfileSource, b: ProfileSource, filterQuery?: string, absolute?: boolean) {
+    this.a = a;
+    this.b = b;
+    this.filterQuery = filterQuery;
+    this.profileType = a.ProfileType();
+    this.absolute = absolute;
   }
 
-  DiffSelection (): ProfileDiffSelection {
-    return new ProfileDiffSelection()
+  DiffSelection(): ProfileDiffSelection {
+    throw new Error('Method not implemented.');
   }
 
-  QueryRequest (): QueryRequest {
-    const req = new QueryRequest()
-    req.setMode(QueryRequest.Mode.MODE_DIFF)
-    const diffQueryRequest = new DiffProfile()
-
-    diffQueryRequest.setA(this.a.DiffSelection())
-    diffQueryRequest.setB(this.b.DiffSelection())
-
-    req.setDiff(diffQueryRequest)
-    return req
+  QueryRequest(): QueryRequest {
+    return {
+      options: {
+        oneofKind: 'diff',
+        diff: {
+          a: this.a.DiffSelection(),
+          b: this.b.DiffSelection(),
+          absolute: this.absolute,
+        },
+      },
+      reportType: QueryRequest_ReportType.FLAMEGRAPH_ARROW,
+      mode: QueryRequest_Mode.DIFF,
+      filterQuery: this.filterQuery,
+      filter: [],
+    };
   }
 
-  Describe (): JSX.Element {
+  ProfileType(): ProfileType {
+    return this.profileType;
+  }
+
+  Describe(): JSX.Element {
     return (
       <>
         <p>Browse the comparison</p>
       </>
-    )
+    );
   }
 
-  toString (): string {
-    return `${this.a.toString()} compared with ${this.b.toString()}`
+  toString(): string {
+    const aDesc = this.a.toString();
+    const bDesc = this.b.toString();
+
+    if (aDesc === bDesc) {
+      return 'Profile comparison';
+    }
+
+    return `${this.a.toString()} compared with ${this.b.toString()}`;
   }
 }
 
 export class MergedProfileSource implements ProfileSource {
-  from: number
-  to: number
-  query: string
+  mergeFrom: number;
+  mergeTo: number;
+  query: Query;
+  filterQuery: string | undefined;
+  profileType: ProfileType;
 
-  constructor (from: number, to: number, query: string) {
-    this.from = from
-    this.to = to
-    this.query = query
+  constructor(mergeFrom: number, mergeTo: number, query: Query, filterQuery?: string) {
+    this.mergeFrom = mergeFrom;
+    this.mergeTo = mergeTo;
+    this.query = query;
+    this.filterQuery = filterQuery;
+    this.profileType = ProfileType.fromString(Query.parse(this.query.toString()).profileName());
   }
 
-  DiffSelection (): ProfileDiffSelection {
-    const sel = new ProfileDiffSelection()
-    sel.setMode(ProfileDiffSelection.Mode.MODE_MERGE)
-
-    const mergeProfile = new MergeProfile()
-
-    const startTs = new Timestamp()
-    startTs.fromDate(moment(this.from).toDate())
-    mergeProfile.setStart(startTs)
-
-    const endTs = new Timestamp()
-    endTs.fromDate(moment(this.to).toDate())
-    mergeProfile.setEnd(endTs)
-
-    mergeProfile.setQuery(this.query)
-
-    sel.setMerge(mergeProfile)
-
-    return sel
+  DiffSelection(): ProfileDiffSelection {
+    return {
+      options: {
+        oneofKind: 'merge',
+        merge: {
+          start: Timestamp.fromDate(new Date(this.mergeFrom)),
+          end: Timestamp.fromDate(new Date(this.mergeTo)),
+          query: this.query.toString(),
+        },
+      },
+      mode: ProfileDiffSelection_Mode.MERGE,
+    };
   }
 
-  QueryRequest (): QueryRequest {
-    const req = new QueryRequest()
-    req.setMode(QueryRequest.Mode.MODE_MERGE)
-
-    const mergeQueryRequest = new MergeProfile()
-
-    const startTs = new Timestamp()
-    startTs.fromDate(moment(this.from).toDate())
-    mergeQueryRequest.setStart(startTs)
-
-    const endTs = new Timestamp()
-    endTs.fromDate(moment(this.to).toDate())
-    mergeQueryRequest.setEnd(endTs)
-
-    mergeQueryRequest.setQuery(this.query)
-
-    req.setMerge(mergeQueryRequest)
-
-    return req
+  QueryRequest(): QueryRequest {
+    return {
+      options: {
+        oneofKind: 'merge',
+        merge: {
+          start: Timestamp.fromDate(new Date(this.mergeFrom)),
+          end: Timestamp.fromDate(new Date(this.mergeTo)),
+          query: this.query.toString(),
+        },
+      },
+      reportType: QueryRequest_ReportType.FLAMEGRAPH_ARROW,
+      mode: QueryRequest_Mode.MERGE,
+      filterQuery: this.filterQuery,
+      filter: [],
+    };
   }
 
-  Describe (): JSX.Element {
-    return (
-      <a>Merge of "{this.query}" from {moment(this.from).utc().format(timeFormat)} to {moment(this.to).utc().format(timeFormat)}</a>
-    )
+  ProfileType(): ProfileType {
+    return this.profileType;
   }
 
-  toString (): string {
-    return `merged profiles of query "${this.query}" from ${moment(this.from).utc().format(timeFormat)} to ${moment(this.to).utc().format(timeFormat)}`
+  stringMatchers(): string[] {
+    return this.query.matchers
+      .filter((m: Matcher) => m.key !== '__name__')
+      .map((m: Matcher) => `${m.key}=${m.value}`);
+  }
+
+  toString(timezone?: string): string {
+    let queryPart = '';
+    if (this.query.toString()?.length > 0) {
+      queryPart = ` of query "${this.query.toString()}"`;
+    }
+
+    let timePart = '';
+    if (this.mergeFrom !== 0) {
+      timePart = `over ${formatDuration({
+        milliseconds: this.mergeTo - this.mergeFrom,
+      })} from ${formatDate(this.mergeFrom, timeFormat(timezone), timezone)} to ${formatDate(
+        this.mergeTo,
+        timeFormat(timezone),
+        timezone
+      )}`;
+    }
+
+    return `Merged profiles${queryPart}${timePart}`;
   }
 }

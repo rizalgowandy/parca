@@ -1,4 +1,4 @@
-// Copyright 2021 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,30 +15,26 @@ package debuginfo
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"os"
 	"path"
-	"strings"
+	"time"
 
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
+	"github.com/google/uuid"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/client"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gopkg.in/yaml.v2"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	debuginfopb "github.com/parca-dev/parca/gen/proto/go/parca/debuginfo/v1alpha1"
-	pb "github.com/parca-dev/parca/gen/proto/go/parca/metastore/v1alpha1"
-	"github.com/parca-dev/parca/pkg/storage/metastore"
-	"github.com/parca-dev/parca/pkg/symbol"
 )
 
-var ErrDebugInfoNotFound = errors.New("debug info not found")
+var ErrDebuginfoNotFound = errors.New("debuginfo not found")
 
 type CacheProvider string
 
@@ -60,204 +56,387 @@ type CacheConfig struct {
 	Config interface{}   `yaml:"config"`
 }
 
-type Store struct {
-	debuginfopb.UnimplementedDebugInfoServiceServer
-
-	bucket objstore.Bucket
-	logger log.Logger
-
-	cacheDir   string
-	symbolizer *symbol.Symbolizer
+type MetadataManager interface {
+	MarkAsDebuginfodSource(ctx context.Context, servers []string, buildID string, typ debuginfopb.DebuginfoType) error
+	MarkAsUploading(ctx context.Context, buildID, uploadID, hash string, typ debuginfopb.DebuginfoType, startedAt *timestamppb.Timestamp) error
+	MarkAsUploaded(ctx context.Context, buildID, uploadID string, typ debuginfopb.DebuginfoType, finishedAt *timestamppb.Timestamp) error
+	Fetch(ctx context.Context, buildID string, typ debuginfopb.DebuginfoType) (*debuginfopb.Debuginfo, error)
 }
 
-// NewStore returns a new debug info store
-func NewStore(logger log.Logger, symbolizer *symbol.Symbolizer, config *Config) (*Store, error) {
-	cfg, err := yaml.Marshal(config.Bucket)
-	if err != nil {
-		return nil, fmt.Errorf("marshal content of object storage configuration: %w", err)
-	}
+type Store struct {
+	debuginfopb.UnimplementedDebuginfoServiceServer
 
-	bucket, err := client.NewBucket(logger, cfg, nil, "parca")
-	if err != nil {
-		return nil, fmt.Errorf("instantiate object storage: %w", err)
-	}
+	tracer trace.Tracer
+	logger log.Logger
 
-	cacheCfg, err := yaml.Marshal(config.Cache)
-	if err != nil {
-		return nil, fmt.Errorf("marshal content of cache configuration: %w", err)
-	}
+	bucket objstore.Bucket
 
-	cache, err := newCache(cacheCfg)
-	if err != nil {
-		return nil, fmt.Errorf("instantiate cache: %w", err)
-	}
+	metadata          MetadataManager
+	debuginfodClients DebuginfodClients
 
+	signedUpload SignedUpload
+
+	maxUploadDuration time.Duration
+	maxUploadSize     int64
+
+	timeNow func() time.Time
+}
+
+type SignedUploadClient interface {
+	SignedPUT(ctx context.Context, objectKey string, size int64, expiry time.Time) (signedURL string, err error)
+}
+
+type SignedUpload struct {
+	Enabled bool
+	Client  SignedUploadClient
+}
+
+// NewStore returns a new debug info store.
+func NewStore(
+	tracer trace.Tracer,
+	logger log.Logger,
+	metadata MetadataManager,
+	bucket objstore.Bucket,
+	debuginfodClients DebuginfodClients,
+	signedUpload SignedUpload,
+	maxUploadDuration time.Duration,
+	maxUploadSize int64,
+) (*Store, error) {
 	return &Store{
-		logger:     log.With(logger, "component", "debuginfo"),
-		bucket:     bucket,
-		cacheDir:   cache.Directory,
-		symbolizer: symbolizer,
+		tracer:            tracer,
+		logger:            log.With(logger, "component", "debuginfo"),
+		bucket:            bucket,
+		metadata:          metadata,
+		debuginfodClients: debuginfodClients,
+		signedUpload:      signedUpload,
+		maxUploadDuration: maxUploadDuration,
+		maxUploadSize:     maxUploadSize,
+		timeNow:           time.Now,
 	}, nil
 }
 
-func newCache(cacheCfg []byte) (*FilesystemCacheConfig, error) {
-	cacheConf := &CacheConfig{}
-	if err := yaml.UnmarshalStrict(cacheCfg, cacheConf); err != nil {
-		return nil, fmt.Errorf("parsing config YAML file: %w", err)
-	}
+const (
+	ReasonDebuginfoInDebuginfod           = "Debuginfo exists in debuginfod, therefore no upload is necessary."
+	ReasonFirstTimeSeen                   = "First time we see this Build ID, and it does not exist in debuginfod, therefore please upload!"
+	ReasonUploadStale                     = "A previous upload was started but not finished and is now stale, so it can be retried."
+	ReasonUploadInProgress                = "A previous upload is still in-progress and not stale yet (only stale uploads can be retried)."
+	ReasonDebuginfoAlreadyExists          = "Debuginfo already exists and is not marked as invalid, therefore no new upload is needed."
+	ReasonDebuginfoAlreadyExistsButForced = "Debuginfo already exists and is not marked as invalid, therefore wouldn't have accepted a new upload, but accepting it because it's requested to be forced."
+	ReasonDebuginfoInvalid                = "Debuginfo already exists but is marked as invalid, therefore a new upload is needed. Hash the debuginfo and initiate the upload."
+	ReasonDebuginfoEqual                  = "Debuginfo already exists and is marked as invalid, but the proposed hash is the same as the one already available, therefore the upload is not accepted as it would result in the same invalid debuginfos."
+	ReasonDebuginfoNotEqual               = "Debuginfo already exists but is marked as invalid, therefore a new upload will be accepted."
+	ReasonDebuginfodSource                = "Debuginfo is available from debuginfod already and not marked as invalid, therefore no new upload is needed."
+	ReasonDebuginfodInvalid               = "Debuginfo is available from debuginfod already but is marked as invalid, therefore a new upload is needed."
+)
 
-	config, err := yaml.Marshal(cacheConf.Config)
-	if err != nil {
-		return nil, fmt.Errorf("marshal content of cache configuration: %w", err)
-	}
+// ShouldInitiateUpload returns whether an upload should be initiated for the
+// given build ID. Checking if an upload should even be initiated allows the
+// parca-agent to avoid extracting debuginfos unnecessarily from a binary.
+func (s *Store) ShouldInitiateUpload(ctx context.Context, req *debuginfopb.ShouldInitiateUploadRequest) (*debuginfopb.ShouldInitiateUploadResponse, error) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("build_id", req.BuildId))
 
-	var c FilesystemCacheConfig
-	switch strings.ToUpper(string(cacheConf.Type)) {
-	case string(FILESYSTEM):
-		if err := yaml.Unmarshal(config, &c); err != nil {
-			return nil, err
-		}
-		if c.Directory == "" {
-			return nil, errors.New("missing directory for filesystem bucket")
-		}
-	default:
-		return nil, fmt.Errorf("cache with type %s is not supported", cacheConf.Type)
-	}
-
-	if _, err := os.Stat(c.Directory); os.IsNotExist(err) {
-		err := os.MkdirAll(c.Directory, 0700)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &c, nil
-}
-
-func (s *Store) Exists(ctx context.Context, req *debuginfopb.ExistsRequest) (*debuginfopb.ExistsResponse, error) {
-	err := validateId(req.BuildId)
-	if err != nil {
+	buildID := req.BuildId
+	if err := validateInput(buildID); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	path := req.BuildId
+	dbginfo, err := s.metadata.Fetch(ctx, buildID, req.Type)
+	if err != nil && !errors.Is(err, ErrMetadataNotFound) {
+		return nil, status.Error(codes.Internal, err.Error())
+	} else if errors.Is(err, ErrMetadataNotFound) {
+		// First time we see this Build ID.
 
-	found := false
-	err = s.bucket.Iter(ctx, path, func(_ string) error {
-		// We just need any debug files to be present.
-		found = true
-		return nil
+		if req.BuildIdType == debuginfopb.BuildIDType_BUILD_ID_TYPE_GNU ||
+			req.BuildIdType == debuginfopb.BuildIDType_BUILD_ID_TYPE_UNKNOWN_UNSPECIFIED {
+			// Only check debuginfod if the build ID type is GNU or unknown
+			// (and unknown is really just for backward compatibility, it
+			// should be removed from this if statement in a couple of
+			// versions.).
+			existsInDebuginfods, err := s.debuginfodClients.Exists(ctx, buildID)
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+
+			if len(existsInDebuginfods) > 0 {
+				if err := s.metadata.MarkAsDebuginfodSource(ctx, existsInDebuginfods, buildID, req.Type); err != nil {
+					return nil, status.Error(codes.Internal, fmt.Errorf("mark Build ID to be available from debuginfod: %w", err).Error())
+				}
+
+				return &debuginfopb.ShouldInitiateUploadResponse{
+					ShouldInitiateUpload: false,
+					Reason:               ReasonDebuginfoInDebuginfod,
+				}, nil
+			}
+		}
+
+		return &debuginfopb.ShouldInitiateUploadResponse{
+			ShouldInitiateUpload: true,
+			Reason:               ReasonFirstTimeSeen,
+		}, nil
+	} else {
+		// We have seen this Build ID before and there is metadata for it.
+
+		switch dbginfo.Source {
+		case debuginfopb.Debuginfo_SOURCE_UPLOAD:
+			if dbginfo.Upload == nil {
+				return nil, status.Error(codes.Internal, "metadata inconsistency: upload is nil")
+			}
+
+			switch dbginfo.Upload.State {
+			case debuginfopb.DebuginfoUpload_STATE_UPLOADING:
+				if s.uploadIsStale(dbginfo.Upload) {
+					return &debuginfopb.ShouldInitiateUploadResponse{
+						ShouldInitiateUpload: true,
+						Reason:               ReasonUploadStale,
+					}, nil
+				}
+
+				return &debuginfopb.ShouldInitiateUploadResponse{
+					ShouldInitiateUpload: false,
+					Reason:               ReasonUploadInProgress,
+				}, nil
+			case debuginfopb.DebuginfoUpload_STATE_UPLOADED:
+				if dbginfo.Quality == nil || !dbginfo.Quality.NotValidElf {
+					if req.Force {
+						return &debuginfopb.ShouldInitiateUploadResponse{
+							ShouldInitiateUpload: true,
+							Reason:               ReasonDebuginfoAlreadyExistsButForced,
+						}, nil
+					}
+
+					return &debuginfopb.ShouldInitiateUploadResponse{
+						ShouldInitiateUpload: false,
+						Reason:               ReasonDebuginfoAlreadyExists,
+					}, nil
+				}
+
+				if req.Hash == "" {
+					return &debuginfopb.ShouldInitiateUploadResponse{
+						ShouldInitiateUpload: true,
+						Reason:               ReasonDebuginfoInvalid,
+					}, nil
+				}
+
+				if dbginfo.Upload.Hash == req.Hash {
+					return &debuginfopb.ShouldInitiateUploadResponse{
+						ShouldInitiateUpload: false,
+						Reason:               ReasonDebuginfoEqual,
+					}, nil
+				}
+
+				return &debuginfopb.ShouldInitiateUploadResponse{
+					ShouldInitiateUpload: true,
+					Reason:               ReasonDebuginfoNotEqual,
+				}, nil
+			default:
+				return nil, status.Error(codes.Internal, "metadata inconsistency: unknown upload state")
+			}
+		case debuginfopb.Debuginfo_SOURCE_DEBUGINFOD:
+			if dbginfo.Quality == nil || !dbginfo.Quality.NotValidElf {
+				// We already have debuginfo that's also not marked to be
+				// invalid, so we don't need to upload it again.
+				return &debuginfopb.ShouldInitiateUploadResponse{
+					ShouldInitiateUpload: false,
+					Reason:               ReasonDebuginfodSource,
+				}, nil
+			}
+
+			return &debuginfopb.ShouldInitiateUploadResponse{
+				ShouldInitiateUpload: true,
+				Reason:               ReasonDebuginfodInvalid,
+			}, nil
+		default:
+			return nil, status.Errorf(codes.Internal, "unknown debuginfo source %q", dbginfo.Source)
+		}
+	}
+}
+
+func (s *Store) InitiateUpload(ctx context.Context, req *debuginfopb.InitiateUploadRequest) (*debuginfopb.InitiateUploadResponse, error) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("build_id", req.BuildId))
+
+	if req.Hash == "" {
+		return nil, status.Error(codes.InvalidArgument, "hash must be set")
+	}
+	if req.Size == 0 {
+		return nil, status.Error(codes.InvalidArgument, "size must be set")
+	}
+
+	// We don't want to blindly accept upload initiation requests that
+	// shouldn't have happened.
+	shouldInitiateResp, err := s.ShouldInitiateUpload(ctx, &debuginfopb.ShouldInitiateUploadRequest{
+		BuildId:     req.BuildId,
+		BuildIdType: req.BuildIdType,
+		Hash:        req.Hash,
+		Force:       req.Force,
+		Type:        req.Type,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if !shouldInitiateResp.ShouldInitiateUpload {
+		if shouldInitiateResp.Reason == ReasonDebuginfoEqual {
+			return nil, status.Error(codes.AlreadyExists, ReasonDebuginfoEqual)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "upload should not have been attempted to be initiated, a previous check should have failed with: %s", shouldInitiateResp.Reason)
+	}
+
+	if req.Size > s.maxUploadSize {
+		return nil, status.Errorf(codes.InvalidArgument, "upload size %d exceeds maximum allowed size %d", req.Size, s.maxUploadSize)
+	}
+
+	uploadID := uuid.New().String()
+	uploadStarted := s.timeNow()
+	uploadExpiry := uploadStarted.Add(s.maxUploadDuration)
+
+	if !s.signedUpload.Enabled {
+		if err := s.metadata.MarkAsUploading(ctx, req.BuildId, uploadID, req.Hash, req.Type, timestamppb.New(uploadStarted)); err != nil {
+			return nil, fmt.Errorf("mark debuginfo upload as uploading via gRPC: %w", err)
+		}
+
+		return &debuginfopb.InitiateUploadResponse{
+			UploadInstructions: &debuginfopb.UploadInstructions{
+				BuildId:        req.BuildId,
+				UploadId:       uploadID,
+				UploadStrategy: debuginfopb.UploadInstructions_UPLOAD_STRATEGY_GRPC,
+				Type:           req.Type,
+			},
+		}, nil
+	}
+
+	signedURL, err := s.signedUpload.Client.SignedPUT(ctx, objectPath(req.BuildId, req.Type), req.Size, uploadExpiry)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	return &debuginfopb.ExistsResponse{
-		Exists: found,
+	if err := s.metadata.MarkAsUploading(ctx, req.BuildId, uploadID, req.Hash, req.Type, timestamppb.New(uploadStarted)); err != nil {
+		return nil, fmt.Errorf("mark debuginfo upload as uploading via signed URL: %w", err)
+	}
+
+	return &debuginfopb.InitiateUploadResponse{
+		UploadInstructions: &debuginfopb.UploadInstructions{
+			BuildId:        req.BuildId,
+			UploadId:       uploadID,
+			UploadStrategy: debuginfopb.UploadInstructions_UPLOAD_STRATEGY_SIGNED_URL,
+			SignedUrl:      signedURL,
+			Type:           req.Type,
+		},
 	}, nil
 }
 
-func (s *Store) Upload(stream debuginfopb.DebugInfoService_UploadServer) error {
+func (s *Store) MarkUploadFinished(ctx context.Context, req *debuginfopb.MarkUploadFinishedRequest) (*debuginfopb.MarkUploadFinishedResponse, error) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("build_id", req.BuildId))
+	span.SetAttributes(attribute.String("upload_id", req.UploadId))
+
+	buildID := req.BuildId
+	if err := validateInput(buildID); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	err := s.metadata.MarkAsUploaded(ctx, buildID, req.UploadId, req.Type, timestamppb.New(s.timeNow()))
+	if errors.Is(err, ErrDebuginfoNotFound) {
+		return nil, status.Error(codes.NotFound, "no debuginfo metadata found for build id")
+	}
+	if errors.Is(err, ErrUploadMetadataNotFound) {
+		return nil, status.Error(codes.NotFound, "no debuginfo upload metadata found for build id")
+	}
+	if errors.Is(err, ErrUploadIDMismatch) {
+		return nil, status.Error(codes.InvalidArgument, "upload id mismatch")
+	}
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &debuginfopb.MarkUploadFinishedResponse{}, nil
+}
+
+func (s *Store) Upload(stream debuginfopb.DebuginfoService_UploadServer) error {
+	if s.signedUpload.Enabled {
+		return status.Error(codes.Unimplemented, "signed URL uploads are the only supported upload strategy for this service")
+	}
+
 	req, err := stream.Recv()
 	if err != nil {
-		msg := "failed to receive upload info"
-		level.Error(s.logger).Log("msg", msg, "err", err)
-		return status.Errorf(codes.Unknown, msg)
+		return status.Errorf(codes.Unknown, "failed to receive upload info: %q", err)
 	}
 
-	buildId := req.GetInfo().BuildId
-	err = validateId(buildId)
-	if err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
-	}
-	path := buildId + "/debuginfo"
+	var (
+		buildID  = req.GetInfo().BuildId
+		uploadID = req.GetInfo().UploadId
+		r        = &UploadReader{stream: stream}
+		typ      = req.GetInfo().Type
+	)
 
-	r := &UploadReader{stream: stream}
-	err = s.bucket.Upload(stream.Context(), path, r)
-	if err != nil {
-		msg := "failed to upload"
-		level.Error(s.logger).Log("msg", msg, "err", err)
-		return status.Errorf(codes.Unknown, msg)
+	ctx := stream.Context()
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("build_id", buildID))
+	span.SetAttributes(attribute.String("upload_id", uploadID))
+
+	if err := s.upload(ctx, buildID, uploadID, typ, r); err != nil {
+		return err
 	}
 
 	return stream.SendAndClose(&debuginfopb.UploadResponse{
-		BuildId: buildId,
+		BuildId: buildID,
 		Size:    r.size,
 	})
 }
 
-func validateId(id string) error {
-	_, err := hex.DecodeString(id)
-	if err != nil {
-		return fmt.Errorf("failed to validate id: %w", err)
+func (s *Store) upload(ctx context.Context, buildID, uploadID string, typ debuginfopb.DebuginfoType, r io.Reader) error {
+	if err := validateInput(buildID); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid build ID: %q", err)
 	}
-	if len(id) <= 2 {
-		return errors.New("unexpectedly short ID")
+
+	dbginfo, err := s.metadata.Fetch(ctx, buildID, typ)
+	if err != nil {
+		if errors.Is(err, ErrMetadataNotFound) {
+			return status.Error(codes.FailedPrecondition, "metadata not found, this indicates that the upload was not previously initiated")
+		}
+		return status.Error(codes.Internal, err.Error())
+	}
+
+	if dbginfo.Upload == nil {
+		return status.Error(codes.FailedPrecondition, "upload metadata not found, this indicates that the upload was not previously initiated")
+	}
+
+	if dbginfo.Upload.Id != uploadID {
+		return status.Error(codes.InvalidArgument, "the upload ID does not match the one returned by the InitiateUpload call")
+	}
+
+	if err := s.bucket.Upload(ctx, objectPath(buildID, typ), r); err != nil {
+		return status.Error(codes.Internal, fmt.Errorf("upload debuginfo: %w", err).Error())
 	}
 
 	return nil
 }
 
-func (s *Store) Symbolize(ctx context.Context, m *pb.Mapping, locations ...*metastore.Location) (map[*metastore.Location][]metastore.LocationLine, error) {
-	localObjPath, err := s.fetchObjectFile(ctx, m.BuildId)
-	if err != nil {
-		level.Debug(s.logger).Log("msg", "failed to fetch object", "object", m.BuildId, "err", err)
-		return nil, fmt.Errorf("failed to symbolize mapping: %w", err)
-	}
-
-	liner, err := s.symbolizer.NewLiner(m, localObjPath)
-	if err != nil {
-		const msg = "failed to create liner"
-		level.Debug(s.logger).Log("msg", msg, "object", m.BuildId, "err", err)
-		return nil, fmt.Errorf(msg+": %w", err)
-	}
-
-	locationLines := map[*metastore.Location][]metastore.LocationLine{}
-	for _, loc := range locations {
-		lines, err := liner.PCToLines(loc.Address)
-		if err != nil {
-			level.Debug(s.logger).Log("msg", "failed to extract source lines", "object", m.BuildId, "err", err)
-			continue
-		}
-		locationLines[loc] = append(locationLines[loc], lines...)
-	}
-	return locationLines, nil
+func (s *Store) uploadIsStale(upload *debuginfopb.DebuginfoUpload) bool {
+	return upload.StartedAt.AsTime().Add(s.maxUploadDuration + 2*time.Minute).Before(s.timeNow())
 }
 
-func (s *Store) fetchObjectFile(ctx context.Context, buildID string) (string, error) {
-	mappingPath := path.Join(s.cacheDir, buildID, "debuginfo")
-	// Check if it's already cached locally; if not download.
-	if _, err := os.Stat(mappingPath); os.IsNotExist(err) {
-		r, err := s.bucket.Get(ctx, path.Join(buildID, "debuginfo"))
-		if s.bucket.IsObjNotFoundErr(err) {
-			level.Debug(s.logger).Log("msg", "object not found", "object", buildID, "err", err)
-			return "", ErrDebugInfoNotFound
-		}
-		if err != nil {
-			return "", fmt.Errorf("get object from object storage: %w", err)
-		}
-		tmpfile, err := ioutil.TempFile("", "symbol-download")
-		if err != nil {
-			return "", fmt.Errorf("create temp file: %w", err)
-		}
-		defer os.Remove(tmpfile.Name())
-
-		_, err = io.Copy(tmpfile, r)
-		if err != nil {
-
-			return "", fmt.Errorf("copy object storage file to local temp file: %w", err)
-		}
-		if err := tmpfile.Close(); err != nil {
-			return "", fmt.Errorf("close tempfile to write object file: %w", err)
-		}
-
-		err = os.MkdirAll(path.Join(s.cacheDir, buildID), 0700)
-		if err != nil {
-			return "", fmt.Errorf("create object file directory: %w", err)
-		}
-		// Need to use rename to make the "creation" atomic.
-		if err := os.Rename(tmpfile.Name(), mappingPath); err != nil {
-			return "", fmt.Errorf("atomically move downloaded object file: %w", err)
-		}
+func validateInput(id string) error {
+	if len(id) <= 2 {
+		return errors.New("unexpectedly short input")
 	}
-	return mappingPath, nil
+
+	return nil
+}
+
+func objectPath(buildID string, typ debuginfopb.DebuginfoType) string {
+	switch typ {
+	case debuginfopb.DebuginfoType_DEBUGINFO_TYPE_EXECUTABLE:
+		return path.Join(buildID, "executable")
+	case debuginfopb.DebuginfoType_DEBUGINFO_TYPE_SOURCES:
+		return path.Join(buildID, "sources")
+	default:
+		return path.Join(buildID, "debuginfo")
+	}
+}
+
+// in a debuginfod server the source path is directly in the URL in the form of
+// debuginfod.example.com/buildid/<build-id>/source/<file>.
+func debuginfodSourcePath(buildID, file string) string {
+	return path.Join(buildID, "source", file)
 }

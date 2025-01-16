@@ -1,0 +1,13 @@
+{
+  "version": "independent",
+  "npmClient": "pnpm",
+  "tagVersionPrefix": "ui-v",
+  "command": {
+    "publish": {
+      "conventionalCommits": true
+    },
+    "version": {
+      "allowBranch": "main"
+    }
+  }
+}

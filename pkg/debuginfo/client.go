@@ -1,4 +1,4 @@
-// Copyright 2021 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,36 +16,46 @@ package debuginfo
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
-	debuginfopb "github.com/parca-dev/parca/gen/proto/go/parca/debuginfo/v1alpha1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	debuginfopb "github.com/parca-dev/parca/gen/proto/go/parca/debuginfo/v1alpha1"
 )
 
-type DebugInfoClient struct {
-	c debuginfopb.DebugInfoServiceClient
+var ErrDebuginfoAlreadyExists = errors.New("debug info already exists")
+
+const (
+	// ChunkSize 8MB is the size of the chunks in which debuginfo files are
+	// uploaded and downloaded. AWS S3 has a minimum of 5MB for multi-part uploads
+	// and a maximum of 15MB, and a default of 8MB.
+	ChunkSize = 1024 * 1024 * 8
+	// MaxMsgSize is the maximum message size the server can receive or send. By default, it is 64MB.
+	MaxMsgSize = 1024 * 1024 * 64
+)
+
+type GrpcDebuginfoUploadServiceClient interface {
+	Upload(ctx context.Context, opts ...grpc.CallOption) (debuginfopb.DebuginfoService_UploadClient, error)
 }
 
-func NewDebugInfoClient(conn *grpc.ClientConn) *DebugInfoClient {
-	return &DebugInfoClient{
-		c: debuginfopb.NewDebugInfoServiceClient(conn),
-	}
+type GrpcUploadClient struct {
+	GrpcDebuginfoUploadServiceClient
 }
 
-func (c *DebugInfoClient) Exists(ctx context.Context, buildId string) (bool, error) {
-	res, err := c.c.Exists(ctx, &debuginfopb.ExistsRequest{
-		BuildId: buildId,
-	})
-	if err != nil {
-		return false, err
-	}
-
-	return res.Exists, nil
+func NewGrpcUploadClient(client GrpcDebuginfoUploadServiceClient) *GrpcUploadClient {
+	return &GrpcUploadClient{client}
 }
 
-func (c *DebugInfoClient) Upload(ctx context.Context, buildId string, r io.Reader) (uint64, error) {
-	stream, err := c.c.Upload(ctx)
+func (c *GrpcUploadClient) Upload(ctx context.Context, uploadInstructions *debuginfopb.UploadInstructions, r io.Reader) (uint64, error) {
+	return c.grpcUpload(ctx, uploadInstructions, r)
+}
+
+func (c *GrpcUploadClient) grpcUpload(ctx context.Context, uploadInstructions *debuginfopb.UploadInstructions, r io.Reader) (uint64, error) {
+	stream, err := c.GrpcDebuginfoUploadServiceClient.Upload(ctx, grpc.MaxCallSendMsgSize(MaxMsgSize))
 	if err != nil {
 		return 0, fmt.Errorf("initiate upload: %w", err)
 	}
@@ -53,21 +63,27 @@ func (c *DebugInfoClient) Upload(ctx context.Context, buildId string, r io.Reade
 	err = stream.Send(&debuginfopb.UploadRequest{
 		Data: &debuginfopb.UploadRequest_Info{
 			Info: &debuginfopb.UploadInfo{
-				BuildId: buildId,
+				UploadId: uploadInstructions.UploadId,
+				BuildId:  uploadInstructions.BuildId,
+				Type:     uploadInstructions.Type,
 			},
 		},
 	})
 	if err != nil {
+		if err := sentinelError(err); err != nil {
+			return 0, err
+		}
 		return 0, fmt.Errorf("send upload info: %w", err)
 	}
 
 	reader := bufio.NewReader(r)
-	buffer := make([]byte, 1024)
+
+	buffer := make([]byte, ChunkSize)
 
 	bytesSent := 0
 	for {
 		n, err := reader.Read(buffer)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -79,15 +95,46 @@ func (c *DebugInfoClient) Upload(ctx context.Context, buildId string, r io.Reade
 				ChunkData: buffer[:n],
 			},
 		})
+		bytesSent += n
+		if errors.Is(err, io.EOF) {
+			// When the stream is closed, the server will send an EOF.
+			// To get the correct error code, we need the status.
+			// So receive the message and check the status.
+			err = stream.RecvMsg(nil)
+			if err := sentinelError(err); err != nil {
+				return 0, err
+			}
+			return 0, fmt.Errorf("send chunk: %w", err)
+		}
 		if err != nil {
 			return 0, fmt.Errorf("send next chunk (%d bytes sent so far): %w", bytesSent, err)
 		}
-		bytesSent += n
 	}
 
+	// It returns io.EOF when the stream completes successfully.
 	res, err := stream.CloseAndRecv()
+	if errors.Is(err, io.EOF) {
+		return res.Size, nil
+	}
 	if err != nil {
-		return 0, fmt.Errorf("close and receive: %w:", err)
+		// On any other error, the stream is aborted and the error contains the RPC status.
+		if err := sentinelError(err); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("close and receive: %w", err)
 	}
 	return res.Size, nil
+}
+
+// sentinelError checks underlying error for grpc.StatusCode and returns if it's a known and expected error.
+func sentinelError(err error) error {
+	if sts, ok := status.FromError(err); ok {
+		if sts.Code() == codes.AlreadyExists {
+			return ErrDebuginfoAlreadyExists
+		}
+		if sts.Code() == codes.FailedPrecondition {
+			return err
+		}
+	}
+	return nil
 }
