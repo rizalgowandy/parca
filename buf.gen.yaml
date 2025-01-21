@@ -5,27 +5,34 @@ managed:
     default: github.com/parca-dev/parca/gen/proto/go
     except:
       - buf.build/googleapis/googleapis
+
 plugins:
-  - name: go
+  # renovate: datasource=github-releases depName=protocolbuffers/protobuf-go
+  - plugin: buf.build/protocolbuffers/go:v1.33.0
     out: gen/proto/go
     opt: paths=source_relative
-  - remote: buf.build/cerbos/plugins/vtproto:v0.2.0-1
+
+  # renovate: datasource=github-releases depName=planetscale/vtprotobuf
+  - plugin: buf.build/community/planetscale-vtprotobuf:v0.6.0
     out: gen/proto/go
     opt:
       - paths=source_relative,features=marshal+unmarshal+size+pool+grpc
-  - name: js
+
+  # renovate: datasource=github-releases depName=timostamm/protobuf-ts
+  - plugin: buf.build/community/timostamm-protobuf-ts:v2.9.4
     out: ui/packages/shared/client/src
     opt:
-      - import_style=commonjs,binary
-  - name: ts
-    path: ./node_modules/.bin/protoc-gen-ts
-    out: ui/packages/shared/client/src
-    opt:
-      - service=grpc-web
-  - name: grpc-gateway
+      - generate_dependencies
+
+  # renovate: datasource=github-releases depName=grpc-ecosystem/grpc-gateway
+  - plugin: buf.build/grpc-ecosystem/gateway:v2.22.0
     out: gen/proto/go
     opt:
       - paths=source_relative
       - generate_unbound_methods=true
-  - name: openapiv2
+
+  # renovate: datasource=github-releases depName=grpc-ecosystem/grpc-gateway
+  - plugin: buf.build/grpc-ecosystem/openapiv2:v2.22.0
     out: gen/proto/swagger
+    opt:
+      - allow_merge=false

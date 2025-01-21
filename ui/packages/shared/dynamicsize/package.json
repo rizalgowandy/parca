@@ -1,15 +1,17 @@
 {
   "name": "@parca/dynamicsize",
-  "version": "0.0.0",
+  "version": "0.16.65",
   "description": "Library all around dynamically sizing components.",
-  "dependencies": {
-
-  },
   "main": "src/index.tsx",
   "scripts": {
     "test": "jest --coverage --config ../../../jest.config.js ./src/*"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "gitHead": "feaaafad44b53ecc44f1d9e35905cd7d1243c4a3"
 }

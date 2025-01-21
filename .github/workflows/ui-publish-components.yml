@@ -1,0 +1,94 @@
+name: Publish UI Components
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # renovate: datasource=npm depName=pnpm versioning=npm
+  PNPM_VERSION: '8.15.9'
+
+jobs:
+  skip-check:
+    name: Skip check
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_skip: ${{ steps.skip-check.outputs.should_skip }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - id: skip-check
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5.3.1
+        with:
+          do_not_skip: '["schedule", "workflow_dispatch"]'
+          paths: |-
+            [
+              ".node-version",
+              "ui/**"
+            ]
+          skip_after_successful_duplicate: false
+
+  publish-ui-components:
+    name: Publish UI components to NPM
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.GH_PAT_UI }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: "0"
+          token: ${{ secrets.GH_PAT_UI }}
+
+      - name: Pull all tags for Lerna semantic release
+        run: |
+          git fetch --depth=1 origin +refs/tags/*:refs/tags/* && \
+          git fetch origin +refs/heads/main:refs/remotes/origin/main && \
+          git checkout main
+
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version-file: .node-version
+          cache: 'pnpm'
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Ensure access
+        working-directory: ui
+        run: |
+          npm config set '//registry.npmjs.org/:_authToken' "${NPM_TOKEN}"
+        env:
+          NPM_TOKEN: ${{ secrets.NPMTOKEN }}
+
+      - name: Config git user
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Install packages with pnpm
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Packages
+        working-directory: ui
+        run: pnpm run build
+
+      - name: Bump versions and publish packages
+        working-directory: ui
+        run: pnpm run publish:ci
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_UI }}

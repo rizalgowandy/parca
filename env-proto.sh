@@ -1,25 +1,30 @@
-#! /usr/bin/env bash
+#!/usr/bin/env bash
+# Copyright 2023-2025 The Parca Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -euo pipefail
 
-BIN_DIR=${BIN_DIR:-/usr/local/bin}
-INCLUDE_DIR=${INCLUDE_DIR:-/usr/local/include}
-PROTOC_VERSION=${PROTOC_VERSION:-3.19.1}
+BIN_DIR="$(go env GOBIN)"
+BIN_DIR="${BIN_DIR:-$(go env GOPATH)/bin}"
 
-mkdir -p ./tmp
-PROTOC_VERSION="${PROTOC_VERSION}" BUILD_DIR="./tmp" scripts/download-protoc.sh
-sudo mv -v -- "./tmp/protoc/bin/protoc" "${BIN_DIR}/protoc"
-sudo cp -vR ./tmp/protoc/include/* "${INCLUDE_DIR}"
+# renovate: datasource=github-releases depName=bufbuild/buf
+BUF_VERSION='v1.47.2'
 
-go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@v2.5.0
-go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v2.5.0
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1
-
-# Substitute VERSION for the current released version.
 # Substitute BINARY_NAME for "buf", "protoc-gen-buf-breaking", or "protoc-gen-buf-lint".
-VERSION="1.0.0-rc8" && \
-BINARY_NAME="buf" && \
-  curl -sSL \
-    "https://github.com/bufbuild/buf/releases/download/v${VERSION}/${BINARY_NAME}-$(uname -s)-$(uname -m)" \
-    -o "${BIN_DIR}/${BINARY_NAME}" && \
-  chmod +x "${BIN_DIR}/${BINARY_NAME}"
+BINARY_NAME="buf"
+
+curl -fsSL \
+    "https://github.com/bufbuild/buf/releases/download/${BUF_VERSION}/${BINARY_NAME}-$(uname -s)-$(uname -m)" \
+    -o "${BIN_DIR}/${BINARY_NAME}"
+
+chmod +x "${BIN_DIR}/${BINARY_NAME}"

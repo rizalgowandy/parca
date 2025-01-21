@@ -1,4 +1,4 @@
-// Copyright 2018 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,45 +14,54 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
-	"github.com/parca-dev/parca/pkg/debuginfo"
 	commonconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery"
 	_ "github.com/prometheus/prometheus/discovery/install" // Imported for registration side-effect
 	"github.com/prometheus/prometheus/discovery/targetgroup"
-	"github.com/prometheus/prometheus/pkg/relabel"
-	"gopkg.in/yaml.v2"
+	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/thanos-io/objstore/client"
+	"gopkg.in/yaml.v3"
 )
 
 const (
-	pprofMemoryTotal       string = "memory_total"
-	pprofBlockTotal        string = "block_total"
-	pprofGoroutineTotal    string = "goroutine_total"
-	pprofMutexTotal        string = "mutex_total"
-	pprofProcessCpu        string = "process_cpu"
-	pprofThreadcreateTotal string = "threadcreate_total"
+	pprofMemory     string = "memory"
+	pprofBlock      string = "block"
+	pprofGoroutine  string = "goroutine"
+	pprofMutex      string = "mutex"
+	pprofProcessCPU string = "process_cpu"
 )
 
-// Config holds all the configuration information for Parca
+// Config holds all the configuration information for Parca.
 type Config struct {
-	DebugInfo     *debuginfo.Config `yaml:"debug_info"`
-	ScrapeConfigs []*ScrapeConfig   `yaml:"scrape_configs,omitempty"`
+	ObjectStorage *ObjectStorage  `yaml:"object_storage,omitempty"`
+	ScrapeConfigs []*ScrapeConfig `yaml:"scrape_configs,omitempty"`
 }
 
-// Validate returns an error if the config is not valid
+type ObjectStorage struct {
+	Bucket *client.BucketConfig `yaml:"bucket,omitempty"`
+}
+
+// Validate returns an error if the config is not valid.
 func (c *Config) Validate() error {
-	return validation.ValidateStruct(c,
-		validation.Field(&c.DebugInfo, validation.Required, debuginfo.Valid),
-	)
+	if err := validation.ValidateStruct(c,
+		validation.Field(&c.ObjectStorage, validation.Required, ObjectStorageValid),
+		validation.Field(&c.ScrapeConfigs, ScrapeConfigsValid),
+	); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func trueValue() *bool {
@@ -67,30 +76,26 @@ func DefaultScrapeConfig() ScrapeConfig {
 		Scheme:         "http",
 		ProfilingConfig: &ProfilingConfig{
 			PprofConfig: PprofConfig{
-				pprofMemoryTotal: &PprofProfilingConfig{
+				pprofMemory: &PprofProfilingConfig{
 					Enabled: trueValue(),
-					Path:    "/debug/pprof/heap",
+					Path:    "/debug/pprof/allocs",
 				},
-				pprofBlockTotal: &PprofProfilingConfig{
+				pprofBlock: &PprofProfilingConfig{
 					Enabled: trueValue(),
 					Path:    "/debug/pprof/block",
 				},
-				pprofGoroutineTotal: &PprofProfilingConfig{
+				pprofGoroutine: &PprofProfilingConfig{
 					Enabled: trueValue(),
 					Path:    "/debug/pprof/goroutine",
 				},
-				pprofMutexTotal: &PprofProfilingConfig{
+				pprofMutex: &PprofProfilingConfig{
 					Enabled: trueValue(),
 					Path:    "/debug/pprof/mutex",
 				},
-				pprofProcessCpu: &PprofProfilingConfig{
+				pprofProcessCPU: &PprofProfilingConfig{
 					Enabled: trueValue(),
 					Delta:   true,
 					Path:    "/debug/pprof/profile",
-				},
-				pprofThreadcreateTotal: &PprofProfilingConfig{
-					Enabled: trueValue(),
-					Path:    "/debug/pprof/threadcreate",
 				},
 			},
 		},
@@ -116,8 +121,9 @@ func (c *Config) SetDirectory(dir string) {
 func Load(s string) (*Config, error) {
 	cfg := &Config{}
 
-	err := yaml.UnmarshalStrict([]byte(s), cfg)
-	if err != nil {
+	dec := yaml.NewDecoder(bytes.NewBuffer([]byte(s)))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
 		return nil, err
 	}
 
@@ -126,7 +132,7 @@ func Load(s string) (*Config, error) {
 
 // LoadFile parses the given YAML file into a Config.
 func LoadFile(filename string) (*Config, error) {
-	content, err := ioutil.ReadFile(filename)
+	content, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +147,7 @@ func LoadFile(filename string) (*Config, error) {
 // ScrapeConfig configures a scraping unit for conprof.
 type ScrapeConfig struct {
 	// Name of the section in the config
-	JobName string `yaml:"job_name,omitempty"`
+	JobName string `yaml:"job_name"`
 	// A set of query parameters with which the target is scraped.
 	Params url.Values `yaml:"params,omitempty"`
 	// How frequently to scrape the targets of this scrape config.
@@ -150,6 +156,10 @@ type ScrapeConfig struct {
 	ScrapeTimeout model.Duration `yaml:"scrape_timeout,omitempty"`
 	// The URL scheme with which to fetch metrics from targets.
 	Scheme string `yaml:"scheme,omitempty"`
+
+	// NormalizedAddresses can be set to true if the addresses returned by the
+	// endpoints have already been normalized.
+	NormalizedAddresses bool `yaml:"normalized_addresses,omitempty"`
 
 	ProfilingConfig *ProfilingConfig `yaml:"profiling_config,omitempty"`
 
@@ -174,6 +184,7 @@ type ServiceDiscoveryConfig struct {
 
 type ProfilingConfig struct {
 	PprofConfig PprofConfig `yaml:"pprof_config,omitempty"`
+	PprofPrefix string      `yaml:"path_prefix,omitempty"`
 }
 
 type PprofConfig map[string]*PprofProfilingConfig
@@ -192,6 +203,8 @@ func (c *ScrapeConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	if unmarshalled.ProfilingConfig == nil {
 		unmarshalled.ProfilingConfig = defaults.ProfilingConfig
+	} else if unmarshalled.ProfilingConfig.PprofConfig == nil {
+		unmarshalled.ProfilingConfig.PprofConfig = defaults.ProfilingConfig.PprofConfig
 	} else {
 		// Merge unmarshalled config with defaults
 		for pt, pc := range defaults.ProfilingConfig.PprofConfig {
@@ -206,6 +219,13 @@ func (c *ScrapeConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 			if unmarshalled.ProfilingConfig.PprofConfig[pt].Path == "" {
 				unmarshalled.ProfilingConfig.PprofConfig[pt].Path = pc.Path
 			}
+		}
+	}
+
+	// If path prefix is specified, add to PprofConfig path
+	if unmarshalled.ProfilingConfig.PprofPrefix != "" {
+		for pt := range unmarshalled.ProfilingConfig.PprofConfig {
+			unmarshalled.ProfilingConfig.PprofConfig[pt].Path = filepath.Join(unmarshalled.ProfilingConfig.PprofPrefix, unmarshalled.ProfilingConfig.PprofConfig[pt].Path)
 		}
 	}
 
@@ -237,16 +257,16 @@ func (c *ScrapeConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	// Validate the scrape and timeout internal configuration. When /debug/pprof/profile scraping
 	// is enabled we need to make sure there is enough time to complete the scrape.
-	if c.ScrapeTimeout > c.ScrapeInterval {
-		return fmt.Errorf("scrape timeout must be smaller or equal to inverval for: %v", c.JobName)
+	if c.ScrapeTimeout == 0 {
+		c.ScrapeTimeout = c.ScrapeInterval + model.Duration(3*time.Second)
+	}
+	if c.ScrapeTimeout <= c.ScrapeInterval {
+		return fmt.Errorf("scrape timeout must be greater than the interval: %v", c.JobName)
 	}
 
-	if c.ScrapeTimeout == 0 {
-		c.ScrapeTimeout = c.ScrapeInterval
-	}
-	if cfg, ok := c.ProfilingConfig.PprofConfig[pprofProcessCpu]; ok {
+	if cfg, ok := c.ProfilingConfig.PprofConfig[pprofProcessCPU]; ok {
 		if *cfg.Enabled && c.ScrapeTimeout < model.Duration(time.Second*2) {
-			return fmt.Errorf("%v scrape_timeout must be at least 2 seconds in %v", pprofProcessCpu, c.JobName)
+			return fmt.Errorf("%v scrape_timeout must be at least 2 seconds in %v", pprofProcessCPU, c.JobName)
 		}
 	}
 
@@ -271,9 +291,16 @@ func checkStaticTargets(configs discovery.Configs) error {
 }
 
 type PprofProfilingConfig struct {
-	Enabled *bool  `yaml:"enabled,omitempty"`
-	Path    string `yaml:"path,omitempty"`
-	Delta   bool   `yaml:"delta,omitempty"`
+	Enabled        *bool        `yaml:"enabled,omitempty"`
+	Path           string       `yaml:"path,omitempty"`
+	Delta          bool         `yaml:"delta,omitempty"`
+	KeepSampleType []SampleType `yaml:"keep_sample_type,omitempty"`
+	Seconds        int          `yaml:"seconds,omitempty"`
+}
+
+type SampleType struct {
+	Type string `yaml:"type,omitempty"`
+	Unit string `yaml:"unit,omitempty"`
 }
 
 // CheckTargetAddress checks if target address is valid.
