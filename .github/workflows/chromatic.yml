@@ -1,0 +1,83 @@
+# .github/workflows/chromatic.yml
+
+# Workflow name
+name: 'Chromatic'
+
+# Event for the workflow
+on:
+  push:
+    branches:
+    - main
+    - release-*
+  pull_request:
+    branches:
+    - main
+    - release-*
+  merge_group:
+    branches:
+    - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # renovate: datasource=npm depName=pnpm versioning=npm
+  PNPM_VERSION: '8.15.9'
+
+# List of jobs
+jobs:
+  skip-check:
+    name: Skip check
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_skip: ${{ steps.skip-check.outputs.should_skip }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - id: skip-check
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5.3.1
+        with:
+          do_not_skip: '["schedule", "workflow_dispatch"]'
+          paths: |-
+            [
+              ".github/workflows/chromatic.yml",
+              ".node-version",
+              "ui/**"
+            ]
+          skip_after_successful_duplicate: false
+  chromatic-deployment:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true' && !github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ./ui
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # Required to retrieve git history
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Set up Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version-file: .node-version
+          cache: 'pnpm'
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Install dependencies and build app
+        run: pnpm install --frozen-lockfile --prefer-offline && pnpm run build
+        # 👇 Adds Chromatic as a step in the workflow
+      - name: Publish to Chromatic
+        uses: chromaui/action@64a9c0ca3bfb724389b0d536e544f56b7b5ff5b3 # v11.20.2
+        # Chromatic GitHub Action options
+        with:
+          # 👇 Chromatic projectToken, refer to the manage page to obtain it.
+          projectToken: ${{ secrets.CHROMATIC_PROJECT_TOKEN }}
+          workingDir: ./ui
+          exitZeroOnChanges: true

@@ -1,4 +1,4 @@
-// Copyright 2021 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,16 +20,23 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	profilepb "github.com/parca-dev/parca/gen/proto/go/parca/profilestore/v1alpha1"
-	scrapepb "github.com/parca-dev/parca/gen/proto/go/parca/scrape/v1alpha1"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
+	"github.com/prometheus/prometheus/model/labels"
 
+	profilepb "github.com/parca-dev/parca/gen/proto/go/parca/profilestore/v1alpha1"
+	scrapepb "github.com/parca-dev/parca/gen/proto/go/parca/scrape/v1alpha1"
 	"github.com/parca-dev/parca/pkg/config"
 )
 
-// NewManager is the Manager constructor
-func NewManager(logger log.Logger, reg prometheus.Registerer, store profilepb.ProfileStoreServiceServer, scrapeConfigs []*config.ScrapeConfig) *Manager {
+// NewManager is the Manager constructor.
+func NewManager(
+	logger log.Logger,
+	reg prometheus.Registerer,
+	store profilepb.ProfileStoreServiceServer,
+	scrapeConfigs []*config.ScrapeConfig,
+	externalLabels labels.Labels,
+) *Manager {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -41,6 +48,8 @@ func NewManager(logger log.Logger, reg prometheus.Registerer, store profilepb.Pr
 		scrapePools:   make(map[string]*scrapePool),
 		graceShut:     make(chan struct{}),
 		triggerReload: make(chan struct{}, 1),
+
+		externalLabels: externalLabels,
 
 		targetIntervalLength: prometheus.NewSummaryVec(
 			prometheus.SummaryOpts{
@@ -104,16 +113,6 @@ func NewManager(logger log.Logger, reg prometheus.Registerer, store profilepb.Pr
 	}
 	m.scrapeConfigs = c
 
-	// Cleanup and reload pool if config has changed.
-	for name, sp := range m.scrapePools {
-		if cfg, ok := m.scrapeConfigs[name]; !ok {
-			sp.stop()
-			delete(m.scrapePools, name)
-		} else if !reflect.DeepEqual(sp.config, cfg) {
-			sp.reload(cfg)
-		}
-	}
-
 	return m
 }
 
@@ -125,6 +124,8 @@ type Manager struct {
 	logger    log.Logger
 	store     profilepb.ProfileStoreServiceServer
 	graceShut chan struct{}
+
+	externalLabels labels.Labels
 
 	mtxScrape     sync.Mutex // Guards the fields below.
 	scrapeConfigs map[string]*config.ScrapeConfig
@@ -143,7 +144,7 @@ type Manager struct {
 	targetScrapeSampleOutOfBounds prometheus.Counter
 }
 
-// Run stars the manager with a set of scrape configs
+// Run starts the manager with a set of scrape configs.
 func (m *Manager) Run(tsets <-chan map[string][]*targetgroup.Group) error {
 	go m.reloader()
 	for {
@@ -183,6 +184,7 @@ func (m *Manager) reloader() {
 
 func (m *Manager) reload() {
 	m.mtxScrape.Lock()
+	defer m.mtxScrape.Unlock()
 	var wg sync.WaitGroup
 	level.Debug(m.logger).Log("msg", "Reloading scrape manager")
 	for setName, groups := range m.targetSets {
@@ -194,7 +196,7 @@ func (m *Manager) reload() {
 				level.Error(m.logger).Log("msg", "error reloading target set", "err", "invalid config id:"+setName)
 				return
 			}
-			sp = newScrapePool(scrapeConfig, m.store, log.With(m.logger, "scrape_pool", setName), &scrapePoolMetrics{
+			sp = newScrapePool(scrapeConfig, m.store, log.With(m.logger, "scrape_pool", setName), m.externalLabels, &scrapePoolMetrics{
 				targetIntervalLength:          m.targetIntervalLength,
 				targetReloadIntervalLength:    m.targetReloadIntervalLength,
 				targetSyncIntervalLength:      m.targetSyncIntervalLength,
@@ -215,9 +217,7 @@ func (m *Manager) reload() {
 			sp.Sync(groups)
 			wg.Done()
 		}(sp, groups)
-
 	}
-	m.mtxScrape.Unlock()
 	wg.Wait()
 }
 
@@ -246,7 +246,6 @@ func (m *Manager) TargetsAll() map[string][]*Target {
 	targets := make(map[string][]*Target, len(m.scrapePools))
 	for tset, sp := range m.scrapePools {
 		targets[tset] = append(sp.ActiveTargets(), sp.DroppedTargets()...)
-
 	}
 	return targets
 }
