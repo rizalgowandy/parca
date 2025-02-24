@@ -9,17 +9,13 @@ local defaults = {
   image: error 'must provide image',
   replicas: error 'must provide replicas',
 
-  configPath: '/var/parca/parca.yaml',
-  configmapName: 'parca-config',
   config: {
-    debug_info: {
+    object_storage: {
       bucket: {
         type: 'FILESYSTEM',
-        config: { directory: './tmp' },
-      },
-      cache: {
-        type: 'FILESYSTEM',
-        config: { directory: './tmp' },
+        config: {
+          directory: '/var/lib/parca',
+        },
       },
     },
   },
@@ -30,7 +26,13 @@ local defaults = {
   port: 7070,
 
   serviceMonitor: false,
+  podSecurityPolicy: false,
+  livenessProbe: true,
+  readinessProbe: true,
   storageRetentionTime: '',
+
+  debugInfodUpstreamServers: ['debuginfod.systemtap.org'],
+  debugInfodHTTPRequestTimeout: '5m',
 
   commonLabels:: {
     'app.kubernetes.io/name': 'parca',
@@ -45,9 +47,15 @@ local defaults = {
     if labelName != 'app.kubernetes.io/version'
   },
 
+  // Pod level security context.
   securityContext:: {
+    supplementalGroups: [65534],
     fsGroup: 65534,
     runAsUser: 65534,
+    runAsNonRoot: true,
+    seccompProfile: {
+      type: 'RuntimeDefault',
+    },
   },
 };
 
@@ -60,6 +68,8 @@ function(params) {
   assert std.isNumber(prc.config.replicas) && prc.config.replicas >= 0 : 'parca replicas has to be number >= 0',
   assert std.isObject(prc.config.resources),
   assert std.isBoolean(prc.config.serviceMonitor),
+  assert std.isBoolean(prc.config.livenessProbe),
+  assert std.isBoolean(prc.config.readinessProbe),
 
   service: {
     apiVersion: 'v1',
@@ -92,8 +102,143 @@ function(params) {
     },
   },
 
-  podSecurityPolicy: {
-    apiVersion: 'policy/v1beta1',
+  configMap: {
+    apiVersion: 'v1',
+    kind: 'ConfigMap',
+    metadata: {
+      name: prc.config.name,
+      namespace: prc.config.namespace,
+      labels: prc.config.commonLabels,
+    },
+    data: {
+      'parca.yaml': std.manifestYamlDoc(prc.config.config),
+    },
+  },
+
+  deployment:
+    local c = {
+      name: 'parca',
+      image: prc.config.image,
+      args:
+        [
+          '/parca',
+          // http-address optionally specifies the TCP address for the server to listen on, in the form "host:port".
+          '--http-address=' + ':' + prc.config.port,
+          '--config-path=/etc/parca/parca.yaml',
+          '--log-level=' + prc.config.logLevel,
+        ] +
+        (if prc.config.corsAllowedOrigins == '' then []
+         else ['--cors-allowed-origins=' + prc.config.corsAllowedOrigins]) +
+        (if prc.config.storageRetentionTime == '' then []
+         else ['--storage-tsdb-retention-time=' + prc.config.storageRetentionTime]) +
+        (if std.length(prc.config.debugInfodUpstreamServers) <= 0 then []
+         else ['--debuginfod-upstream-servers=' + std.join(',', prc.config.debugInfodUpstreamServers)]) +
+        (if prc.config.debugInfodHTTPRequestTimeout == '' then []
+         else ['--debuginfod-http-request-timeout=' + prc.config.debugInfodHTTPRequestTimeout]),
+      ports: [
+        { name: port.name, containerPort: port.port }
+        for port in prc.service.spec.ports
+      ],
+      // Container level security context.
+      securityContext: {
+        allowPrivilegeEscalation: false,
+        capabilities: {
+          drop: ['ALL'],
+        },
+      },
+      volumeMounts: [
+        {
+          name: 'config',
+          mountPath: '/etc/parca',
+        },
+      ] + (
+        if prc.config.config.object_storage.bucket.type == 'FILESYSTEM' then [{
+          name: 'data',
+          mountPath: prc.config.config.object_storage.bucket.config.directory,
+        }] else []
+      ),
+      resources: if prc.config.resources != {} then prc.config.resources else {},
+      terminationMessagePolicy: 'FallbackToLogsOnError',
+      livenessProbe: if prc.config.livenessProbe == true then {
+        initialDelaySeconds: 5,
+        exec: {
+          command: ['/grpc_health_probe', '-v', '-addr=:' + prc.config.port],
+        },
+      },
+      readinessProbe: if prc.config.readinessProbe == true then {
+        initialDelaySeconds: 10,
+        exec: {
+          command: ['/grpc_health_probe', '-v', '-addr=:' + prc.config.port],
+        },
+      },
+    };
+
+    {
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: {
+        name: prc.config.name,
+        namespace: prc.config.namespace,
+        labels: prc.config.commonLabels,
+      },
+      spec: {
+        replicas: prc.config.replicas,
+        selector: { matchLabels: prc.config.podLabelSelector },
+        template: {
+          metadata: {
+            labels: prc.config.commonLabels,
+          },
+          spec: {
+            containers: [c],
+            securityContext: prc.config.securityContext,
+            serviceAccountName: prc.serviceAccount.metadata.name,
+            terminationGracePeriodSeconds: 120,
+            volumes: [
+              {
+                name: 'config',
+                configMap: { name: prc.configMap.metadata.name },
+              },
+            ] + (
+              if prc.config.config.object_storage.bucket.type == 'FILESYSTEM' then [{
+                name: 'data',
+                emptyDir: {},
+              }] else []
+            ),
+            nodeSelector: {
+              'kubernetes.io/os': 'linux',
+            },
+          },
+        },
+      },
+    },
+
+  [if std.objectHas(params, 'serviceMonitor') && params.serviceMonitor then 'serviceMonitor']: {
+    apiVersion: 'monitoring.coreos.com/v1',
+    kind: 'ServiceMonitor',
+    metadata+: {
+      name: prc.config.name,
+      namespace: prc.config.namespace,
+      labels: prc.config.commonLabels,
+    },
+    spec: {
+      selector: {
+        matchLabels: prc.config.podLabelSelector,
+      },
+      endpoints: [
+        {
+          port: prc.service.spec.ports[0].name,
+          relabelings: [{
+            sourceLabels: ['namespace', 'pod'],
+            separator: '/',
+            targetLabel: 'instance',
+          }],
+        },
+      ],
+    },
+  },
+
+  [if std.objectHas(params, 'podSecurityPolicy') && params.podSecurityPolicy then 'podSecurityPolicy']: {
+    apiVersion: 'policy/v1',
     kind: 'PodSecurityPolicy',
     metadata: {
       name: prc.config.name,
@@ -138,7 +283,7 @@ function(params) {
     },
   },
 
-  role: {
+  [if std.objectHas(params, 'podSecurityPolicy') && params.podSecurityPolicy then 'role']: {
     apiVersion: 'rbac.authorization.k8s.io/v1',
     kind: 'Role',
     metadata: {
@@ -164,7 +309,7 @@ function(params) {
     ],
   },
 
-  roleBinding: {
+  [if std.objectHas(params, 'podSecurityPolicy') && params.podSecurityPolicy then 'roleBinding']: {
     apiVersion: 'rbac.authorization.k8s.io/v1',
     kind: 'RoleBinding',
     metadata: {
@@ -183,110 +328,5 @@ function(params) {
         name: prc.serviceAccount.metadata.name,
       },
     ],
-  },
-
-  configmap: {
-    apiVersion: 'v1',
-    kind: 'ConfigMap',
-    metadata: {
-      name: prc.config.configmapName,
-      namespace: prc.config.namespace,
-    },
-    data: {
-      'parca.yaml': std.manifestYamlDoc(prc.config.config),
-    },
-  },
-
-  deployment:
-    local c = {
-      name: 'parca',
-      image: prc.config.image,
-      args:
-        [
-          '/parca',
-          '--config-path=' + prc.config.configPath,
-          '--log-level=' + prc.config.logLevel,
-        ] +
-        (if prc.config.corsAllowedOrigins == '' then []
-         else ['--cors-allowed-origins=' + prc.config.corsAllowedOrigins]) +
-        (if prc.config.storageRetentionTime == '' then []
-         else ['--storage-tsdb-retention-time=' + prc.config.storageRetentionTime]),
-      ports: [
-        { name: port.name, containerPort: port.port }
-        for port in prc.service.spec.ports
-      ],
-      volumeMounts: [{ name: 'parca-config', mountPath: '/var/parca' }],
-      resources: if prc.config.resources != {} then prc.config.resources else {},
-      terminationMessagePolicy: 'FallbackToLogsOnError',
-      livenessProbe: {
-        initialDelaySeconds: 5,
-        exec: {
-          command: ['/grpc-health-probe', '-v', '-addr=:' + prc.config.port],
-        },
-      },
-      readinessProbe: {
-        initialDelaySeconds: 10,
-        exec: {
-          command: ['/grpc-health-probe', '-v', '-addr=:' + prc.config.port],
-        },
-      },
-    };
-
-    {
-      apiVersion: 'apps/v1',
-      kind: 'Deployment',
-      metadata: {
-        name: prc.config.name,
-        namespace: prc.config.namespace,
-        labels: prc.config.commonLabels,
-      },
-      spec: {
-        replicas: prc.config.replicas,
-        selector: { matchLabels: prc.config.podLabelSelector },
-        template: {
-          metadata: {
-            labels: prc.config.commonLabels,
-          },
-          spec: {
-            containers: [c],
-            securityContext: prc.config.securityContext,
-            serviceAccountName: prc.serviceAccount.metadata.name,
-            terminationGracePeriodSeconds: 120,
-            volumes: [{
-              name: 'parca-config',
-              configMap: { name: prc.config.configmapName },
-            }],
-            nodeSelector: {
-              'kubernetes.io/os': 'linux',
-              'kubernetes.io/arch': 'amd64',
-            },
-          },
-        },
-      },
-    },
-
-  serviceMonitor: if prc.config.serviceMonitor == true then {
-    apiVersion: 'monitoring.coreos.com/v1',
-    kind: 'ServiceMonitor',
-    metadata+: {
-      name: prc.config.name,
-      namespace: prc.config.namespace,
-      labels: prc.config.commonLabels,
-    },
-    spec: {
-      selector: {
-        matchLabels: prc.config.podLabelSelector,
-      },
-      endpoints: [
-        {
-          port: prc.service.spec.ports[0].name,
-          relabelings: [{
-            sourceLabels: ['namespace', 'pod'],
-            separator: '/',
-            targetLabel: 'instance',
-          }],
-        },
-      ],
-    },
   },
 }

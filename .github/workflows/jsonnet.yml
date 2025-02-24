@@ -2,20 +2,61 @@ name: Jsonnet
 
 on:
   push:
-    branches: [ main ]
+    branches:
+    - main
+    - release-*
   pull_request:
-    branches: [ main ]
+    branches:
+    - main
+    - release-*
+  merge_group:
+    branches:
+    - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  skip-check:
+    name: Skip check
+    continue-on-error: true
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_skip: ${{ steps.skip-check.outputs.should_skip }}
+    permissions:
+      actions: write
+      contents: read
     steps:
-      - uses: actions/checkout@v2
+      - id: skip-check
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5.3.1
+        with:
+          do_not_skip: '["schedule", "workflow_dispatch"]'
+          paths: |-
+            [
+              "*.jsonnet",
+              "*.libsonnet",
+              ".github/workflows/jsonnet.yml",
+              ".go-version",
+              "deploy/**"
+            ]
+          skip_after_successful_duplicate: false
+
+  build:
+    name: Jsonnet Build
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
-          go-version: 1.16
+          go-version-file: .go-version
+          check-latest: true
 
       - name: Set up Jsonnet
         run: ./env-jsonnet.sh
@@ -23,8 +64,8 @@ jobs:
       - name: Generate
         run: cd deploy && make --always-make vendor manifests
 
-      - name: Archive generatated manifests
-        uses: actions/upload-artifact@v2
+      - name: Archive generated manifests
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: manifests
           path: |

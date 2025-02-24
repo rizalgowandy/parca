@@ -1,35 +1,94 @@
 before:
   hooks:
     - go mod tidy
+    - make ui/build
 builds:
   - main: ./cmd/parca/
     id: "parca"
     binary: parca
+    # https://goreleaser.com/customization/build/#reproducible-builds
+    mod_timestamp: "{{ .CommitTimestamp }}"
     env:
       - CGO_ENABLED=0
     goos:
       - linux
-      - windows
       - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
     flags:
       - -trimpath
       - -v
     ldflags:
-      - main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser`
+      # Default is `-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser`.
+      - -X main.version={{.Version}} -X main.commit={{.Commit}}
 archives:
-  - replacements:
-      darwin: Darwin
-      linux: Linux
-      windows: Windows
-      386: i386
-      amd64: x86_64
+    # e.g. parca_0.15.0_Darwin_arm64.tar.gz, parca_0.15.0_Darwin_x86_64.tar.gz, parca_0.15.0_Linux_arm64.tar.gz, parca_0.15.0_Linux_x86_64.tar.gz
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- trimprefix .Version "v" }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
     format_overrides:
       - goos: windows
         format: zip
+snapcrafts:
+  - name: parca
+    # Handle publishing with snapcraft itself
+    publish: false
+    summary: Parca continuous profiling tool
+    description: |
+      Continuous profiling for analysis of CPU and memory usage, down to the line
+      number and throughout time. Saving infrastructure cost, improving performance,
+      and increasing reliability.
+    grade: stable
+    confinement: strict
+    license: Apache-2.0
+    base: core22
+    extra_files:
+      - source: snap/parca-wrapper
+        destination: bin/parca-wrapper
+        mode: 0755
+      - source: snap/example-config.yaml
+        destination: usr/share/parca/example-config.yaml
+        mode: 0700
+      - source: snap/hooks/configure
+        destination: snap/hooks/configure
+        mode: 0755
+      - source: snap/hooks/configure
+        destination: meta/hooks/configure
+        mode: 0755
+    apps:
+      parca:
+        command: parca
+        plugs:
+          - network-bind
+          - network
+          - home
+          - etc-parca
+      parca-svc:
+        command: bin/parca-wrapper
+        daemon: simple
+        install_mode: disable
+        restart_condition: never
+        plugs:
+          - network-bind
+          - network
+          - home
+          - etc-parca
+    plugs:
+      etc-parca:
+        interface: system-files
+        read:
+          - /etc/parca
 checksum:
-  name_template: 'checksums.txt'
+  name_template: "checksums.txt"
 snapshot:
-  name_template: "{{ incpatch .Tag }}-next"
+  name_template: "{{ incpatch .Tag }}-{{ .ShortCommit }}"
+source:
+  enabled: true
 release:
   prerelease: auto
   # Defaults to empty.
@@ -48,16 +107,5 @@ changelog:
   use: github
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
-
-# Disabled until fixing the authentication issue with ghcr.
-#dockers:
-#  - id: parca
-#    goos: linux
-#    goarch: amd64
-#    dockerfile: Dockerfile.release
-#    extra_files:
-#    - parca.yaml
-#    image_templates:
-#    - ghcr.io/parca-dev/parca:{{ .Tag }}
+      - "^docs:"
+      - "^test:"

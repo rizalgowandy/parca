@@ -1,4 +1,4 @@
-// Copyright 2021 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -10,6 +10,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
 
 package queryv1alpha1
 
@@ -20,7 +21,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Validate the QueryRangeRequest
+// Validate the QueryRangeRequest.
 func (r *QueryRangeRequest) Validate() error {
 	return validation.ValidateStruct(r,
 		validation.Field(&r.Start, validation.Required),
@@ -29,7 +30,7 @@ func (r *QueryRangeRequest) Validate() error {
 	)
 }
 
-// Validate the QueryRequest
+// Validate the QueryRequest.
 func (r *QueryRequest) Validate() error {
 	err := validation.ValidateStruct(r,
 		validation.Field(
@@ -162,12 +163,12 @@ func optionMatchesDiffProfileSelectionMode(mode ProfileDiffSelection_Mode) DiffP
 	}
 }
 
-// DiffProfileSelectionOptionMatchesRule ensure the options match the requested mode
+// DiffProfileSelectionOptionMatchesRule ensure the options match the requested mode.
 type DiffProfileSelectionOptionMatchesRule struct {
 	mode ProfileDiffSelection_Mode
 }
 
-// Validate the option matches mode
+// Validate the option matches mode.
 func (o DiffProfileSelectionOptionMatchesRule) Validate(v interface{}) error {
 	option, ok := v.(isProfileDiffSelection_Options)
 	if !ok {
@@ -196,12 +197,12 @@ func optionMatchesProfileMode(mode QueryRequest_Mode) ProfileOptionMatchesRule {
 	}
 }
 
-// ProfileOptionMatchesRule ensure the options match the requested mode
+// ProfileOptionMatchesRule ensure the options match the requested mode.
 type ProfileOptionMatchesRule struct {
 	mode QueryRequest_Mode
 }
 
-// Validate the option matches mode
+// Validate the option matches mode.
 func (o ProfileOptionMatchesRule) Validate(v interface{}) error {
 	option, ok := v.(isQueryRequest_Options)
 	if !ok {
@@ -289,12 +290,12 @@ func (r ReportTypeRule) Validate(v interface{}) error {
 	return nil
 }
 
-// AfterRule validates that the timestamp is after the given value
+// AfterRule validates that the timestamp is after the given value.
 type AfterRule struct {
 	Timestamp *timestamppb.Timestamp
 }
 
-// Validate runs the validation function for the AfterRule
+// Validate runs the validation function for the AfterRule.
 func (a AfterRule) Validate(t interface{}) error {
 	end, ok := t.(*timestamppb.Timestamp)
 	if !ok {

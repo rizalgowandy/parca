@@ -1,4 +1,4 @@
-// Copyright 2021 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,37 +14,39 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"net/http/pprof"
 	"strings"
+	"text/template"
 	"time"
 
+	"github.com/felixge/fgprof"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	"github.com/grpc-ecosystem/go-grpc-middleware/providers/kit/v2"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/thanos-io/thanos/pkg/prober"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	grpc_health "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
-	"google.golang.org/grpc/status"
 
-	"github.com/parca-dev/parca/ui"
+	"github.com/parca-dev/parca/pkg/debuginfo"
+	"github.com/parca-dev/parca/pkg/prober"
 )
 
 type Registerable interface {
@@ -57,113 +59,106 @@ func (f RegisterableFunc) Register(ctx context.Context, srv *grpc.Server, mux *r
 	return f(ctx, srv, mux, endpoint, opts)
 }
 
-// MapAllowedLevels allows to map a given level to a list of allowed level.
-// Convention taken from go-kit/level v0.10.0 https://godoc.org/github.com/go-kit/kit/log/level#AllowAll.
-var MapAllowedLevels = map[string][]string{
-	"DEBUG": {"INFO", "DEBUG", "WARN", "ERROR"},
-	"ERROR": {"ERROR"},
-	"INFO":  {"INFO", "WARN", "ERROR"},
-	"WARN":  {"WARN", "ERROR"},
-}
-
-// Server is a wrapper around the http.Server
+// Server is a wrapper around the http.Server.
 type Server struct {
 	http.Server
 	grpcProbe *prober.GRPCProbe
 	reg       *prometheus.Registry
+	version   string
 }
 
-func NewServer(reg *prometheus.Registry) *Server {
+func NewServer(reg *prometheus.Registry, version string) *Server {
 	return &Server{
 		grpcProbe: prober.NewGRPC(),
 		reg:       reg,
+		version:   version,
 	}
 }
 
-// ListenAndServe starts the http grpc gateway server
-func (s *Server) ListenAndServe(ctx context.Context, logger log.Logger, port string, allowedCORSOrigins []string, registerables ...Registerable) error {
-	level.Info(logger).Log("msg", "starting server", "addr", port)
-	logLevel := "ERROR"
+// ListenAndServe starts the http grpc gateway server.
+func (s *Server) ListenAndServe(
+	ctx context.Context,
+	logger log.Logger,
+	uiFS fs.FS,
+	addr string,
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+	allowedCORSOrigins []string,
+	pathPrefix string,
+	registerables ...Registerable,
+) error {
+	level.Info(logger).Log("msg", "starting server", "addr", addr)
 
 	logOpts := []grpc_logging.Option{
-		grpc_logging.WithDecider(func(_ string, err error) grpc_logging.Decision {
-
-			runtimeLevel := grpc_logging.DefaultServerCodeToLevel(status.Code(err))
-			for _, lvl := range MapAllowedLevels[logLevel] {
-				if string(runtimeLevel) == strings.ToLower(lvl) {
-					return grpc_logging.LogFinishCall
-				}
-			}
-			return grpc_logging.NoLogCall
-		}),
+		grpc_logging.WithLogOnEvents(grpc_logging.FinishCall),
 		grpc_logging.WithLevels(DefaultCodeToLevelGRPC),
 	}
 
-	met := grpc_prometheus.NewServerMetrics()
-	met.EnableHandlingTimeHistogram(
-		grpc_prometheus.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120}),
+	met := grpc_prometheus.NewServerMetrics(
+		grpc_prometheus.WithServerHandlingTimeHistogram(
+			grpc_prometheus.WithHistogramOpts(&prometheus.HistogramOpts{
+				NativeHistogramBucketFactor: 1.1,
+				Buckets:                     nil,
+			}),
+		),
 	)
 
 	// Start grpc server with API server registered
 	srv := grpc.NewServer(
-		grpc.StreamInterceptor(
-			grpc_middleware.ChainStreamServer(
-				otelgrpc.StreamServerInterceptor(),
-				met.StreamServerInterceptor(),
-				grpc_logging.StreamServerInterceptor(kit.InterceptorLogger(logger), logOpts...),
-			)),
-		grpc.UnaryInterceptor(
-			grpc_middleware.ChainUnaryServer(
-				otelgrpc.UnaryServerInterceptor(),
-				met.UnaryServerInterceptor(),
-				grpc_logging.UnaryServerInterceptor(kit.InterceptorLogger(logger), logOpts...),
-			),
+		// It is increased to 32MB to account for large protobuf messages (debug information uploads and downloads).
+		grpc.MaxSendMsgSize(debuginfo.MaxMsgSize),
+		grpc.MaxRecvMsgSize(debuginfo.MaxMsgSize),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.ChainStreamInterceptor(
+			met.StreamServerInterceptor(),
+			grpc_logging.StreamServerInterceptor(InterceptorLogger(logger), logOpts...),
+		),
+		grpc.ChainUnaryInterceptor(
+			met.UnaryServerInterceptor(),
+			grpc_logging.UnaryServerInterceptor(InterceptorLogger(logger), logOpts...),
 		),
 	)
 
-	opts := []grpc.DialOption{grpc.WithInsecure()}
-	mux := runtime.NewServeMux()
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+
+	grpcWebMux := runtime.NewServeMux()
 	for _, r := range registerables {
-		if err := r.Register(ctx, srv, mux, port, opts); err != nil {
+		if err := r.Register(ctx, srv, grpcWebMux, addr, opts); err != nil {
 			return err
 		}
 	}
 	reflection.Register(srv)
 	grpc_health.RegisterHealthServer(srv, s.grpcProbe.HealthServer())
 
-	err := mux.HandlePath(http.MethodGet, "/metrics", func(w http.ResponseWriter, r *http.Request, pathParams map[string]string) {
-		promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}).ServeHTTP(w, r)
-	})
-	if err != nil {
-		return fmt.Errorf("failed to register metrics handler: %w", err)
-	}
+	internalMux := chi.NewRouter()
 
-	// Add the pprof handler to profile Parca
-	err = mux.HandlePath(http.MethodGet, "/debug/pprof/*", func(w http.ResponseWriter, r *http.Request, pathParams map[string]string) {
-		if r.URL.Path == "/debug/pprof/profile" {
-			pprof.Profile(w, r)
-			return
-		}
-		pprof.Index(w, r)
-	})
-	if err != nil {
-		return fmt.Errorf("failed to register pprof handlers: %w", err)
-	}
+	internalMux.Route(pathPrefix+"/", func(r chi.Router) {
+		r.Mount("/api", grpcWebMux)
 
-	uiFS, err := fs.Sub(ui.FS, "packages/app/web/dist")
+		r.Handle("/metrics", promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}))
+
+		// Add the pprof handler to profile Parca
+		r.Handle("/debug/pprof/*", http.StripPrefix(pathPrefix, http.HandlerFunc(pprof.Index)))
+		r.Handle("/debug/pprof/fgprof", fgprof.Handler())
+		r.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		r.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	})
+
+	uiHandler, err := s.uiHandler(uiFS, pathPrefix)
 	if err != nil {
-		return fmt.Errorf("failed to initialize UI filesystem: %w", err)
+		return fmt.Errorf("failed to walk ui filesystem: %w", err)
 	}
 
 	s.Server = http.Server{
-		Addr: port,
+		Addr: addr,
 		Handler: grpcHandlerFunc(
 			srv,
-			fallbackNotFound(mux, http.FileServer(http.FS(uiFS))),
+			fallbackNotFound(internalMux, uiHandler),
 			allowedCORSOrigins,
 		),
-		ReadTimeout:  5 * time.Second, // TODO make config option
-		WriteTimeout: time.Minute,     // TODO make config option
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
 	}
 
 	met.InitializeMetrics(srv)
@@ -180,10 +175,84 @@ func (s *Server) ListenAndServe(ctx context.Context, logger log.Logger, port str
 	return s.Server.ListenAndServe()
 }
 
-// Shutdown the server
+// Shutdown the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.grpcProbe.NotReady(nil)
 	return s.Server.Shutdown(ctx)
+}
+
+// uiHandler initialize a http.ServerMux with the UI files.
+//
+// There is currently no way to go between `http.FileServer(http.FS(uiFS))` and execute
+// templates. Taking an FS registering paths and executing templates seems to be the best option
+// for now.
+func (s *Server) uiHandler(uiFS fs.FS, pathPrefix string) (*http.ServeMux, error) {
+	uiHandler := http.ServeMux{}
+
+	err := fs.WalkDir(uiFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() || strings.HasSuffix(d.Name(), ".map") {
+			return nil
+		}
+
+		b, err := fs.ReadFile(uiFS, path)
+		if err != nil {
+			return fmt.Errorf("failed to read ui file %s: %w", path, err)
+		}
+
+		if strings.HasSuffix(path, ".html") {
+			tmpl, err := template.New(path).Parse(strings.Replace(string(b), "/PATH_PREFIX_VAR", "{{.PathPrefix}}", -1))
+			if err != nil {
+				return fmt.Errorf("failed to parse ui file %s: %w", path, err)
+			}
+
+			var outputBuffer bytes.Buffer
+
+			err = tmpl.Execute(&outputBuffer, struct {
+				Version    string
+				PathPrefix string
+			}{
+				s.version,
+				pathPrefix,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to execute ui file %s: %w", path, err)
+			}
+
+			b = outputBuffer.Bytes()
+		}
+
+		fi, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("failed to receive file info %s: %w", path, err)
+		}
+
+		paths := []string{fmt.Sprintf("/%s", path)}
+
+		if paths[0] == "/index.html" {
+			paths = append(paths, "/")
+		}
+
+		if paths[0] == "/targets/index.html" {
+			paths = append(paths, "/targets")
+		}
+
+		for _, path := range paths {
+			uiHandler.HandleFunc(pathPrefix+path, func(w http.ResponseWriter, r *http.Request) {
+				http.ServeContent(w, r, d.Name(), fi.ModTime(), bytes.NewReader(b))
+			})
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &uiHandler, nil
 }
 
 func grpcHandlerFunc(grpcServer *grpc.Server, otherHandler http.Handler, allowedCORSOrigins []string) http.Handler {
@@ -195,10 +264,12 @@ func grpcHandlerFunc(grpcServer *grpc.Server, otherHandler http.Handler, allowed
 	for _, o := range allowedCORSOrigins {
 		origins[o] = struct{}{}
 	}
-	wrappedGrpc := grpcweb.WrapServer(grpcServer, grpcweb.WithOriginFunc(func(origin string) bool {
-		_, found := origins[origin]
-		return found || allowAll
-	}))
+	wrappedGrpc := grpcweb.WrapServer(grpcServer,
+		grpcweb.WithAllowNonRootResource(true),
+		grpcweb.WithOriginFunc(func(origin string) bool {
+			_, found := origins[origin]
+			return found || allowAll
+		}))
 
 	corsMiddleware := cors.New(cors.Options{
 		AllowOriginFunc: func(r *http.Request, origin string) bool {
@@ -218,25 +289,39 @@ func grpcHandlerFunc(grpcServer *grpc.Server, otherHandler http.Handler, allowed
 	})
 
 	return corsMiddleware.Handler(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
-			grpcServer.ServeHTTP(w, r)
-		} else {
-			if wrappedGrpc.IsGrpcWebRequest(r) {
-				wrappedGrpc.ServeHTTP(w, r)
-				return
-			}
-
-			otherHandler.ServeHTTP(w, r)
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			wrappedGrpc.ServeHTTP(w, r)
+			return
 		}
+		otherHandler.ServeHTTP(w, r)
 	}), &http2.Server{}))
+}
+
+// InterceptorLogger adapts go-kit logger to interceptor logger.
+func InterceptorLogger(l log.Logger) grpc_logging.Logger {
+	return grpc_logging.LoggerFunc(func(_ context.Context, lvl grpc_logging.Level, msg string, fields ...any) {
+		largs := append([]any{"msg", msg}, fields...)
+		switch lvl {
+		case grpc_logging.LevelDebug:
+			_ = level.Debug(l).Log(largs...)
+		case grpc_logging.LevelInfo:
+			_ = level.Info(l).Log(largs...)
+		case grpc_logging.LevelWarn:
+			_ = level.Warn(l).Log(largs...)
+		case grpc_logging.LevelError:
+			_ = level.Error(l).Log(largs...)
+		default:
+			panic(fmt.Sprintf("unknown level %v", lvl))
+		}
+	})
 }
 
 // DefaultCodeToLevelGRPC is the helper mapper that maps gRPC Response codes to log levels.
 func DefaultCodeToLevelGRPC(c codes.Code) grpc_logging.Level {
 	switch c {
 	case codes.Unknown, codes.Unimplemented, codes.Internal, codes.DataLoss:
-		return grpc_logging.ERROR
+		return grpc_logging.LevelError
 	default:
-		return grpc_logging.DEBUG
+		return grpc_logging.LevelDebug
 	}
 }

@@ -1,278 +1,456 @@
-import { Grammar, Parser } from 'nearley'
-import grammar from './selector'
+// Copyright 2022 The Parca Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-export function NewParser (): Parser {
-  return new Parser(
-    Grammar.fromCompiled(grammar),
-    { keepHistory: true }
-  )
+import {Grammar, Parser} from 'nearley';
+
+import {grammar} from './selector';
+
+export function NewParser(): Parser {
+  return new Parser(Grammar.fromCompiled(grammar), {keepHistory: true});
 }
 
-export enum MatcherType {
-  MatchEqual = '=',
-  MatchNotEqual = '!=',
-  MatchRegexp = '=~',
-  MatchNotRegexp = '!~'
-}
+export const MatcherTypes = {
+  MatchEqual: '=',
+  MatchNotEqual: '!=',
+  MatchRegexp: '=~',
+  MatchNotRegexp: '!~',
+} as const;
 
-function matcherTypeFromString (matcherTypeString: string): MatcherType {
+export type MatcherType = (typeof MatcherTypes)[keyof typeof MatcherTypes];
+
+function matcherTypeFromString(matcherTypeString: string): MatcherType {
   switch (matcherTypeString) {
-    case MatcherType.MatchEqual: {
-      return MatcherType.MatchEqual
+    case MatcherTypes.MatchEqual: {
+      return MatcherTypes.MatchEqual;
     }
-    case MatcherType.MatchNotEqual: {
-      return MatcherType.MatchNotEqual
+    case MatcherTypes.MatchNotEqual: {
+      return MatcherTypes.MatchNotEqual;
     }
-    case MatcherType.MatchRegexp: {
-      return MatcherType.MatchRegexp
+    case MatcherTypes.MatchRegexp: {
+      return MatcherTypes.MatchRegexp;
     }
-    case MatcherType.MatchNotRegexp: {
-      return MatcherType.MatchNotRegexp
+    case MatcherTypes.MatchNotRegexp: {
+      return MatcherTypes.MatchNotRegexp;
     }
     default: {
-      throw new Error('Unknown matcher type: ' + matcherTypeString)
+      throw new Error('Unknown matcher type: ' + matcherTypeString);
     }
   }
 }
 
-export class Matcher {
-  key: string
-  matcherType: MatcherType
-  value: string
+function findMatcherLabelName(stateStack: any): string {
+  let currentState = stateStack.find((e: any) => e.rule.name === 'matcher');
 
-  constructor (key: string, matcherType: MatcherType, value: string) {
-    this.key = key
-    this.matcherType = matcherType
-    this.value = value
+  if (currentState === undefined) {
+    return '';
   }
 
-  toString (): string {
-    return `${this.key}${this.matcherType}"${this.value}"`
+  while (currentState.right.rule.name !== 'labelName') {
+    currentState = currentState.left;
+  }
+
+  return currentState.right.data.value;
+}
+
+export interface LiteralSuggestion {
+  type: 'literal';
+  value: string;
+  typeahead: string;
+}
+
+export interface MatcherTypeSuggestion {
+  type: 'matcherType';
+  typeahead: string;
+}
+
+export interface LabelNameSuggestion {
+  type: 'labelName';
+  typeahead: string;
+}
+
+export interface LabelValueSuggestion {
+  type: 'labelValue';
+  typeahead: string;
+  labelName: string;
+}
+
+export interface ProfileNameSuggestion {
+  type: 'profileName';
+  typeahead: string;
+}
+
+export type Suggestion =
+  | LiteralSuggestion
+  | MatcherTypeSuggestion
+  | LabelNameSuggestion
+  | LabelValueSuggestion
+  | ProfileNameSuggestion;
+
+export class Matcher {
+  key: string;
+  matcherType: MatcherType;
+  value: string;
+
+  constructor(key: string, matcherType: MatcherType, value: string) {
+    this.key = key;
+    this.matcherType = matcherType;
+    this.value = value;
+  }
+
+  toString(): string {
+    return `${this.key}${this.matcherType}"${this.value}"`;
   }
 }
 
-function isProfileNameMatcher (m: Matcher): boolean {
-  return m.key === '__name__' && m.matcherType === MatcherType.MatchEqual
+function isProfileNameMatcher(m: Matcher): boolean {
+  return m.key === '__name__' && m.matcherType === MatcherTypes.MatchEqual;
+}
+
+export class ProfileType {
+  profileName: string;
+  sampleType: string;
+  sampleUnit: string;
+  periodType: string;
+  periodUnit: string;
+  delta: boolean;
+
+  constructor(
+    profileName: string,
+    sampleType: string,
+    sampleUnit: string,
+    periodType: string,
+    periodUnit: string,
+    delta: boolean
+  ) {
+    this.profileName = profileName;
+    this.sampleType = sampleType;
+    this.sampleUnit = sampleUnit;
+    this.periodType = periodType;
+    this.periodUnit = periodUnit;
+    this.delta = delta;
+  }
+
+  static fromString(profileType: string): ProfileType {
+    const str = profileType.toString();
+    const parts = str.split(':');
+    if (parts.length !== 5 && parts.length !== 6) {
+      throw new Error('Invalid profile type: ' + str);
+    }
+    return new ProfileType(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5] === 'delta');
+  }
+
+  toString(): string {
+    if (
+      this.profileName === '' &&
+      this.sampleType === '' &&
+      this.sampleUnit === '' &&
+      this.periodType === '' &&
+      this.periodUnit === ''
+    ) {
+      return '';
+    }
+    return `${this.profileName}:${this.sampleType}:${this.sampleUnit}:${this.periodType}:${
+      this.periodUnit
+    }${this.delta ? ':delta' : ''}`;
+  }
 }
 
 export class Query {
-  matchers: Matcher[]
-  inputMatcherString: string
+  profType: ProfileType;
+  matchers: Matcher[];
+  inputMatcherString: string;
 
-  constructor (matchers: Matcher[], inputMatcherString: string) {
-    this.matchers = matchers
-    this.inputMatcherString = inputMatcherString
+  constructor(profileType: ProfileType, matchers: Matcher[], inputMatcherString: string) {
+    this.profType = profileType;
+    this.matchers = matchers;
+    this.inputMatcherString = inputMatcherString;
   }
 
-  static fromAst (ast: any): Query {
+  static fromAst(ast: any): Query {
     if (ast === undefined || ast == null) {
-      return new Query([], '')
+      return new Query(new ProfileType('', '', '', '', '', false), [], '');
     }
 
-    const profileNameMatchers = (ast.profileName?.text !== undefined) ? [new Matcher('__name__', MatcherType.MatchEqual, ast.profileName.value)] : []
-    const matchers = ast.matchers.map((e) => new Matcher(e.key.value, matcherTypeFromString(e.matcherType.value), e.value.value))
-    return new Query(profileNameMatchers.concat(matchers), '')
+    const matchers = ast.matchers.map(
+      (e: any) =>
+        new Matcher(e.key.value, matcherTypeFromString(e.matcherType.value), e.value.value)
+    );
+    return new Query(ProfileType.fromString(ast.profileName.value), matchers, '');
   }
 
-  static parse (input: string): Query {
-    const p = NewParser()
-    p.save()
+  static parse(input: string): Query {
+    const p = NewParser();
+    p.save();
     try {
-      p.feed(input)
-      p.save()
+      p.feed(input);
+      p.save();
     } catch (error) {
       // do nothing... this means we've got an incomplete or entirely incorrect query
     }
 
     if (p.results?.length > 0) {
-      return Query.fromAst(p.results[0])
+      return Query.fromAst(p.results[0]);
     }
 
     // partial parse result, also ok, we'll try our best with it :)
 
     // Parser.table is not defined in the type definitions, so we need to do this unfortunately.
-    const parserTable = p.table as any[]
-    const column = parserTable.filter(c => c.states.find(s => s.data !== undefined && s.data != null && Object.prototype.hasOwnProperty.call(s.data, 'profileName')))[0]
-    if (column !== undefined) {
-      const data = column.states.find(s => s.data !== undefined && Object.prototype.hasOwnProperty.call(s.data, 'profileName')).data
-      const rest = input.slice(column.lexerState.col - 2)
-      return new Query(
-        [new Matcher('__name__', MatcherType.MatchEqual, data.profileName.value)],
-        rest.length > 0 ? rest : input
+    const parserTable = (p as any).table;
+    const column = parserTable.filter((c: any) =>
+      c.states.find(
+        (s: any) =>
+          s.data !== undefined &&
+          s.data != null &&
+          Object.prototype.hasOwnProperty.call(s.data, 'profileName')
       )
+    )[0];
+    if (column !== undefined) {
+      const data = column.states.find(
+        (s: any) =>
+          s.data !== undefined && Object.prototype.hasOwnProperty.call(s.data, 'profileName')
+      ).data;
+      const rest = input.slice(column.lexerState.col - 2);
+      return new Query(
+        ProfileType.fromString(data.profileName),
+        [],
+        rest.length > 0 ? rest : input
+      );
     }
 
-    return new Query([], input)
+    return new Query(new ProfileType('', '', '', '', '', false), [], '');
   }
 
-  static tryParse (p: Parser, input: string): {
-    lastIndex: number
-    successfulParse: boolean
+  static tryParse(
+    p: Parser,
+    input: string
+  ): {
+    successfulParse: boolean;
   } {
     try {
-      p.feed(input)
-      p.save()
+      p.feed(input);
+      p.save();
       return {
         successfulParse: true,
-        lastIndex: p.table.length - 1
-      }
+      };
     } catch (error) {
       return {
         successfulParse: false,
-        lastIndex: p.table.length - 2
-      }
+      };
     }
   }
 
-  static suggest (input: string): any[] {
-    const p = NewParser()
-    p.save()
-    const { lastIndex, successfulParse } = Query.tryParse(p, input)
+  static suggest(input: string): any[] {
+    const p = NewParser();
+    p.save();
+    const {successfulParse} = Query.tryParse(p, input);
+    const parserTable = (p as any).table as any[];
 
-    const parserTable = p.table
-    const column = parserTable[lastIndex]
-    const lastLexerStateIndex = parserTable.reverse().findIndex(e => e.lexerState !== undefined)
-    const lastValidCursor = lastLexerStateIndex >= 0 ? parserTable[lastLexerStateIndex].lexerState.col - 1 : input.length
-    const rest: string = input.slice(lastValidCursor)
-
-    const expectantStates = column.states.filter(function (state) {
-      const nextSymbol = state.rule.symbols[state.dot]
-      return nextSymbol
-    })
-
-    const stateStacks = expectantStates.map(function (state) {
-      const firstStateStack = this.buildFirstStateStack(state, [])
-      return firstStateStack === undefined ? [state] : firstStateStack
-    }, p)
-
-    const suggestions: any[] = []
-
-    const prevLabelNameStates = column.states.filter(e => e.rule.name === 'labelName' && e.isComplete)
-    if (successfulParse && prevLabelNameStates.length > 0 && prevLabelNameStates[0].data !== undefined) {
-      suggestions.push({
-        type: 'labelName',
-        typeahead: prevLabelNameStates[0].data.value
-      })
+    // we want the last column with states, if there is a column with no states
+    // it means nothing could sucessfully be produced.
+    let lastColumnIndex = parserTable.length - 1;
+    for (; lastColumnIndex >= 0; lastColumnIndex--) {
+      if (parserTable[lastColumnIndex].states.length > 0) {
+        break;
+      }
     }
 
-    stateStacks.forEach(function (stateStack) {
-      const state = stateStack[0]
-      const nextSymbol = state.rule.symbols[state.dot]
+    const column = parserTable[lastColumnIndex];
+
+    const lastLexerStateIndex = parserTable
+      .reverse()
+      .findIndex((e: any) => e.lexerState !== undefined);
+    const lastValidCursor =
+      lastLexerStateIndex >= 0 ? parserTable[lastLexerStateIndex].lexerState.col - 1 : input.length;
+    const rest: string = input.slice(lastValidCursor);
+
+    // Filter out states that don't expect any more input. If the dot is within
+    // the range of the list of symbols of the rule, then they are eligible.
+    const expectantStates = column.states.filter(function (state: any) {
+      return state.dot < state.rule.symbols.length;
+    });
+
+    // Build all the state stacks, meaning, take all the possible states and
+    // for each state, walk the stack of states to the root. That way we
+    // essentially have the "callstack" of states that led to this state.
+    const stateStacks = expectantStates.map(function (this: any, state: any) {
+      const firstStateStack = this.buildFirstStateStack(state, []);
+      return firstStateStack === undefined ? [state] : firstStateStack;
+    }, p);
+
+    const suggestions: Suggestion[] = [];
+
+    const prevLabelNameStates = column.states.filter(
+      (e: any) => e.rule.name === 'labelName' && e.isComplete
+    );
+
+    if (
+      successfulParse &&
+      prevLabelNameStates.length > 0 &&
+      prevLabelNameStates[0].data !== undefined
+    ) {
+      suggestions.push({
+        type: 'labelName',
+        typeahead: prevLabelNameStates[0].data.value,
+      });
+    }
+
+    stateStacks.forEach(function (stateStack: any[]) {
+      const state = stateStack[0];
+      const nextSymbol = state.rule.symbols[state.dot];
 
       // We're not going to skip suggesting to type a whitespace character.
       if (!(nextSymbol.type !== undefined && nextSymbol.type === 'space')) {
         if (nextSymbol.literal !== undefined) {
-          const suggestion = { type: 'literal', value: (nextSymbol.literal as string) }
-          if (suggestions.findIndex((s) => (s.type === 'literal' && s.value === suggestion.value)) === -1) {
-            if (successfulParse ||
-                suggestion.value.startsWith(rest)) {
-              suggestions.push(suggestion)
+          const suggestedValue = nextSymbol.literal as string;
+          if (
+            suggestions.findIndex(s => s.type === 'literal' && s.value === suggestedValue) === -1
+          ) {
+            if (successfulParse || suggestedValue.startsWith(rest)) {
+              suggestions.push({type: 'literal', value: suggestedValue, typeahead: rest});
             }
           }
         }
 
         // Find the high level concept that we can complete.
-        // For an ident type, those can be: profileName, labelName.
-        const types = ['profileName', 'labelName']
+        // For an ident type, those can be: profileName, labelName or labelValue.
+        const types = ['profileName', 'labelName', 'labelValue'];
 
         if (nextSymbol.type !== undefined && nextSymbol.type === 'ident') {
-          const found = state.wantedBy.filter((e) => types.includes(e.rule.name))
-          const s = found === undefined ? [] : found
-          s.map((e) => e.rule.name).forEach(function (e) {
-            const suggestion = { type: e, typeahead: '' }
-            suggestions.push(suggestion)
-          })
+          const found = state.wantedBy.filter((e: any) => types.includes(e.rule.name));
+          const s = found === undefined ? [] : found;
+          s.map((e: any) => e.rule.name).forEach(function (e: any) {
+            const suggestion = {type: e, typeahead: ''};
+            suggestions.push(suggestion);
+          });
         }
 
         // Matcher type is unambiguous, so we can go ahead and check if
         // the label name may be incomplete and suggest any matcher.
         if (nextSymbol.type !== undefined && nextSymbol.type === 'matcherType') {
-          const suggestion = {
+          suggestions.push({
             type: 'matcherType',
-            typeahead: rest
-          }
-          suggestions.push(suggestion)
+            typeahead: rest,
+          });
         }
 
         // A valid strstart always means a label value.
         if (nextSymbol.type !== undefined && nextSymbol.type === 'strstart') {
-          const prevMatcherTypeStates = column.states.filter(e => e.rule.name === 'matcherType' && e.isComplete)
+          const prevMatcherTypeStates = column.states.filter(
+            (e: any) => e.rule.name === 'matcherType' && e.isComplete
+          );
           if (prevMatcherTypeStates.length > 0 && prevMatcherTypeStates[0].data !== undefined) {
             suggestions.push({
               type: 'matcherType',
-              typeahead: prevMatcherTypeStates[0].data.value
-            })
+              typeahead: prevMatcherTypeStates[0].data.value,
+            });
           }
-
-          suggestions.push({
-            type: 'labelValue',
-            typeahead: ''
-          })
         }
 
         if (nextSymbol.type !== undefined && nextSymbol.type === 'constant') {
           suggestions.push({
             type: 'labelValue',
-            typeahead: '"'
-          })
+            labelName: findMatcherLabelName(stateStack),
+            typeahead: '',
+          });
         }
 
         if (nextSymbol.type !== undefined && nextSymbol.type === 'strend') {
-          const prevConstStates = column.states.filter(e => e.rule.name === 'constant' && e.isComplete)
+          const prevConstStates = column.states.filter(
+            (e: any) => e.rule.name === 'constant' && e.isComplete
+          );
           if (prevConstStates.length > 0 && prevConstStates[0].data !== undefined) {
             suggestions.push({
               type: 'labelValue',
-              typeahead: `"${prevConstStates[0].data.value as string}`
-            })
+              labelName: findMatcherLabelName(stateStack),
+              typeahead: `${prevConstStates[0].data.value as string}`,
+            });
           }
         }
       }
-    })
+    });
 
-    return suggestions
+    return suggestions;
   }
 
-  setMatcher (key: string, value: string): [Query, boolean] {
+  setMatcher(key: string, value: string): [Query, boolean] {
     if (this.matchers.find(e => e.key === key && e.value === `"${value}"`) != null) {
-      return [this, false]
+      return [this, false];
     }
-    const matcher = new Matcher(key, MatcherType.MatchEqual, value)
-    if ((this.matchers.find(e => e.key === key) != null)) {
-      return [new Query(this.matchers.map(e => e.key === key ? matcher : e), ''), true]
+    const matcher = new Matcher(key, MatcherTypes.MatchEqual, value);
+    if (this.matchers.find(e => e.key === key) != null) {
+      return [
+        new Query(
+          this.profType,
+          this.matchers.map(e => (e.key === key ? matcher : e)),
+          ''
+        ),
+        true,
+      ];
     }
-    return [new Query(this.matchers.concat([matcher]), ''), true]
+    return [new Query(this.profType, this.matchers.concat([matcher]), ''), true];
   }
 
-  setProfileName (name: string): [Query, boolean] {
+  setMultipleMatchers(matchers: Array<{key: string; value: string}>): [Query, boolean] {
+    const newMatchers: Matcher[] = [];
+    matchers.forEach(({key, value}: {key: string; value: string}) => {
+      const newMatcher = new Matcher(key, MatcherTypes.MatchEqual, value);
+      newMatchers.push(newMatcher);
+    });
+
+    return [new Query(this.profType, newMatchers, ''), true];
+  }
+
+  setProfileName(name: string): [Query, boolean] {
+    const profileType = ProfileType.fromString(name);
     if (this.inputMatcherString !== undefined && this.inputMatcherString.length > 0) {
-      return [new Query([new Matcher('__name__', MatcherType.MatchEqual, name)], this.inputMatcherString), true]
+      return [new Query(profileType, this.matchers, this.inputMatcherString), true];
     }
-    return this.setMatcher('__name__', name)
+    if (this.profType === profileType) {
+      return [this, false];
+    }
+    return [new Query(profileType, this.matchers, this.inputMatcherString), true];
   }
 
-  profileName (): string {
-    const matcher = this.matchers.find(isProfileNameMatcher)
-    return (matcher != null) ? matcher.value : ''
+  profileName(): string {
+    return this.profType.toString();
   }
 
-  nonProfileNameMatchers (): Matcher[] {
-    return this.matchers.filter(m => !(isProfileNameMatcher(m)))
+  profileType(): ProfileType {
+    return this.profType;
   }
 
-  matchersString (): string {
-    if (this.inputMatcherString !== undefined && this.inputMatcherString.length > 0) { return stripCurlyBrackets(this.inputMatcherString) }
-    const m = this.nonProfileNameMatchers()
-    return m.length > 0 ? m.map(m => m.toString()).join(', ') : ''
+  nonProfileNameMatchers(): Matcher[] {
+    return this.matchers.filter(m => !isProfileNameMatcher(m));
   }
 
-  toString (): string {
-    return `${this.profileName()}{${this.matchersString()}}`
+  matchersString(): string {
+    if (this.inputMatcherString !== undefined && this.inputMatcherString.length > 0) {
+      return stripCurlyBrackets(this.inputMatcherString);
+    }
+    const m = this.nonProfileNameMatchers();
+    return m.length > 0 ? m.map(m => m.toString()).join(', ') : '';
+  }
+
+  toString(): string {
+    return `${this.profileName()}{${this.matchersString()}}`;
   }
 }
 
-function stripCurlyBrackets (input: string) {
-  const withoutStartingCurly = input.startsWith('{') ? input.slice(1) : input
-  const withoutEndingCurly = withoutStartingCurly.endsWith('}') ? withoutStartingCurly.slice(0, withoutStartingCurly.length - 1) : withoutStartingCurly
+function stripCurlyBrackets(input: string): string {
+  const withoutStartingCurly = input.startsWith('{') ? input.slice(1) : input;
+  const withoutEndingCurly = withoutStartingCurly.endsWith('}')
+    ? withoutStartingCurly.slice(0, withoutStartingCurly.length - 1)
+    : withoutStartingCurly;
 
-  return withoutEndingCurly
+  return withoutEndingCurly;
 }

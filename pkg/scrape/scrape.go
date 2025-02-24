@@ -1,4 +1,4 @@
-// Copyright 2021 The Parca Authors
+// Copyright 2022-2025 The Parca Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,26 +16,28 @@ package scrape
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	profilepb "github.com/parca-dev/parca/gen/proto/go/parca/profilestore/v1alpha1"
-	"github.com/parca-dev/parca/pkg/config"
-	"github.com/pkg/errors"
+	"github.com/google/pprof/profile"
 	"github.com/prometheus/client_golang/prometheus"
 	commonconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/pool"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/util/pool"
 	"golang.org/x/net/context/ctxhttp"
+
+	profilepb "github.com/parca-dev/parca/gen/proto/go/parca/profilestore/v1alpha1"
+	"github.com/parca-dev/parca/pkg/config"
 )
 
 // scrapePool manages scrapes for sets of targets.
@@ -69,7 +71,13 @@ type scrapePoolMetrics struct {
 	targetScrapeSampleOutOfBounds prometheus.Counter
 }
 
-func newScrapePool(cfg *config.ScrapeConfig, store profilepb.ProfileStoreServiceServer, logger log.Logger, metrics *scrapePoolMetrics) *scrapePool {
+func newScrapePool(
+	cfg *config.ScrapeConfig,
+	store profilepb.ProfileStoreServiceServer,
+	logger log.Logger,
+	externalLabels labels.Labels,
+	metrics *scrapePoolMetrics,
+) *scrapePool {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -99,9 +107,11 @@ func newScrapePool(cfg *config.ScrapeConfig, store profilepb.ProfileStoreService
 			t,
 			s,
 			log.With(logger, "target", t),
+			externalLabels,
 			sp.metrics.targetIntervalLength,
 			buffers,
 			store,
+			cfg.NormalizedAddresses,
 		)
 	}
 
@@ -173,7 +183,7 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) {
 	for fp, oldLoop := range sp.loops {
 		var (
 			t       = sp.activeTargets[fp]
-			s       = &targetScraper{Target: t, client: sp.client, timeout: timeout}
+			s       = &targetScraper{Target: t, logger: sp.logger, client: sp.client, timeout: timeout}
 			newLoop = sp.newLoop(t, s)
 		)
 		wg.Add(1)
@@ -200,19 +210,24 @@ func (sp *scrapePool) Sync(tgs []*targetgroup.Group) {
 	start := time.Now()
 
 	var all []*Target
+	var targets []*Target
+	lb := labels.NewBuilder(labels.EmptyLabels())
 	sp.mtx.Lock()
 	sp.droppedTargets = []*Target{}
 	for _, tg := range tgs {
-		targets, err := targetsFromGroup(tg, sp.config)
+		targets, err := targetsFromGroup(tg, sp.config, targets, lb)
 		if err != nil {
 			level.Error(sp.logger).Log("msg", "creating targets failed", "err", err)
 			continue
 		}
 
 		for _, t := range targets {
-			if t.Labels().Len() > 0 {
+			// Replicate .Labels().IsEmpty() with a loop here to avoid generating garbage.
+			nonEmpty := false
+			t.LabelsRange(func(l labels.Label) { nonEmpty = true })
+			if nonEmpty {
 				all = append(all, t)
-			} else if t.DiscoveredLabels().Len() > 0 {
+			} else if !t.discoveredLabels.IsEmpty() {
 				sp.droppedTargets = append(sp.droppedTargets, t)
 			}
 		}
@@ -320,6 +335,10 @@ func (s *targetScraper) scrape(ctx context.Context, w io.Writer, profileType str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusPermanentRedirect {
+			return fmt.Errorf("server is being redirected with HTTP status %s, please add the destination path", resp.Status)
+		}
+
 		return fmt.Errorf("server returned HTTP status %s", resp.Status)
 	}
 
@@ -327,9 +346,9 @@ func (s *targetScraper) scrape(ctx context.Context, w io.Writer, profileType str
 	case ProfileTraceType:
 		return fmt.Errorf("unimplemented")
 	default:
-		b, err := ioutil.ReadAll(io.TeeReader(resp.Body, w))
+		b, err := io.ReadAll(io.TeeReader(resp.Body, w))
 		if err != nil {
-			return errors.Wrap(err, "failed to read body")
+			return fmt.Errorf("failed to read body: %w", err)
 		}
 
 		if len(b) == 0 {
@@ -352,6 +371,9 @@ type scrapeLoop struct {
 	l              log.Logger
 	intervalLength *prometheus.SummaryVec
 	lastScrapeSize int
+	externalLabels labels.Labels
+
+	normalizedAddresses bool
 
 	buffers *pool.Pool
 
@@ -366,9 +388,11 @@ func newScrapeLoop(ctx context.Context,
 	t *Target,
 	sc scraper,
 	l log.Logger,
+	externalLabels labels.Labels,
 	targetIntervalLength *prometheus.SummaryVec,
 	buffers *pool.Pool,
 	store profilepb.ProfileStoreServiceServer,
+	normalizedAddresses bool,
 ) *scrapeLoop {
 	if l == nil {
 		l = log.NewNopLogger()
@@ -377,14 +401,16 @@ func newScrapeLoop(ctx context.Context,
 		buffers = pool.New(1e3, 1e6, 3, func(sz int) interface{} { return make([]byte, 0, sz) })
 	}
 	sl := &scrapeLoop{
-		target:         t,
-		scraper:        sc,
-		buffers:        buffers,
-		store:          store,
-		stopped:        make(chan struct{}),
-		l:              l,
-		intervalLength: targetIntervalLength,
-		ctx:            ctx,
+		target:              t,
+		scraper:             sc,
+		buffers:             buffers,
+		store:               store,
+		stopped:             make(chan struct{}),
+		l:                   l,
+		externalLabels:      externalLabels,
+		intervalLength:      targetIntervalLength,
+		ctx:                 ctx,
+		normalizedAddresses: normalizedAddresses,
 	}
 	sl.scrapeCtx, sl.cancel = context.WithCancel(ctx)
 
@@ -451,8 +477,12 @@ mainLoop:
 
 			tl := sl.target.Labels()
 			tl = append(tl, labels.Label{Name: "__name__", Value: profileType})
-			// Must ensure label-set is sorted
-			sort.Sort(tl)
+			sl.externalLabels.Range(func(l labels.Label) {
+				tl = append(tl, labels.Label{
+					Name:  l.Name,
+					Value: l.Value,
+				})
+			})
 			level.Debug(sl.l).Log("msg", "appending new sample", "labels", tl.String())
 
 			protolbls := &profilepb.LabelSet{
@@ -465,22 +495,77 @@ mainLoop:
 				})
 			}
 
-			_, err := sl.store.WriteRaw(sl.ctx, &profilepb.WriteRawRequest{
-				Tenant: "",
+			byt := buf.Bytes()
+			p, err := profile.ParseData(byt)
+			if err != nil {
+				level.Error(sl.l).Log("msg", "failed to parse profile data", "err", err)
+				continue
+			}
+
+			var executableInfo []*profilepb.ExecutableInfo
+			for _, comment := range p.Comments {
+				if strings.HasPrefix(comment, "executableInfo=") {
+					ei, err := parseExecutableInfo(comment)
+					if err != nil {
+						level.Error(sl.l).Log("msg", "failed to parse executableInfo", "err", err)
+						continue
+					}
+
+					executableInfo = append(executableInfo, ei)
+				}
+			}
+
+			ks := sl.target.KeepSet()
+			if len(ks) > 0 {
+				keepIndexes := []int{}
+				newTypes := []*profile.ValueType{}
+				for i, st := range p.SampleType {
+					if _, ok := ks[config.SampleType{Type: st.Type, Unit: st.Unit}]; ok {
+						keepIndexes = append(keepIndexes, i)
+						newTypes = append(newTypes, st)
+					}
+				}
+				p.SampleType = newTypes
+				for _, s := range p.Sample {
+					newValues := []int64{}
+					for _, i := range keepIndexes {
+						newValues = append(newValues, s.Value[i])
+					}
+					s.Value = newValues
+				}
+				p = p.Compact()
+				newB := sl.buffers.Get(sl.lastScrapeSize).([]byte)
+				newBuf := bytes.NewBuffer(newB)
+				if err := p.Write(newBuf); err != nil {
+					level.Error(sl.l).Log("msg", "failed to write profile data", "err", err)
+					continue
+				}
+				sl.buffers.Put(b)
+				byt = newBuf.Bytes()
+				b = newB // We want to make sure we return the new buffer to the pool further below.
+			}
+
+			_, err = sl.store.WriteRaw(sl.ctx, &profilepb.WriteRawRequest{
+				Normalized: sl.normalizedAddresses,
 				Series: []*profilepb.RawProfileSeries{
 					{
 						Labels: protolbls,
 						Samples: []*profilepb.RawSample{
 							{
-								RawProfile: buf.Bytes(),
+								RawProfile:     byt,
+								ExecutableInfo: executableInfo,
 							},
 						},
 					},
 				},
 			})
-			if err != nil && errc != nil {
-				level.Debug(sl.l).Log("err", err)
-				errc <- err
+			if err != nil {
+				switch errc {
+				case nil:
+					level.Error(sl.l).Log("msg", "WriteRaw failed for scraped profile", "err", err)
+				default:
+					errc <- err
+				}
 			}
 
 			sl.target.health = HealthGood
@@ -513,6 +598,44 @@ mainLoop:
 	}
 
 	close(sl.stopped)
+}
+
+// parseExecutableInfo parses the executableInfo string from the comment. It is in the format of: "executableInfo=elfType;offset;vaddr".
+func parseExecutableInfo(comment string) (*profilepb.ExecutableInfo, error) {
+	eiString := strings.TrimPrefix(comment, "executableInfo=")
+	eiParts := strings.Split(eiString, ";")
+	if len(eiParts) == 0 {
+		return nil, errors.New("executableInfo string is empty")
+	}
+
+	var (
+		res = &profilepb.ExecutableInfo{}
+		err error
+	)
+
+	if len(eiParts) >= 1 {
+		elfType, err := strconv.ParseUint(strings.TrimPrefix(eiParts[0], "0x"), 16, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse elfType: %w", err)
+		}
+
+		res.ElfType = uint32(elfType)
+	}
+
+	if len(eiParts) == 3 {
+		res.LoadSegment = &profilepb.LoadSegment{}
+		res.LoadSegment.Offset, err = strconv.ParseUint(strings.TrimPrefix(eiParts[1], "0x"), 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse load segment offset: %w", err)
+		}
+
+		res.LoadSegment.Vaddr, err = strconv.ParseUint(strings.TrimPrefix(eiParts[2], "0x"), 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse load segment vaddr: %w", err)
+		}
+	}
+
+	return res, nil
 }
 
 // Stop the scraping. May still write data and stale markers after it has
